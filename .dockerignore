@@ -1,0 +1,15 @@
+*
+!Dockerfile
+!datasets.json
+!scripts/
+!scripts/*.py
+!dataset-map.example.json
+!suite.example.json
+!README.md
+!requirements*.lock
+!perf.example.json
+!scripts/perf_vendor/
+!scripts/perf_vendor/*.py
+!scripts/perf_vendor/LICENSE
+!scripts/perf_vendor/PROVENANCE.json
+!perf.native.example.json

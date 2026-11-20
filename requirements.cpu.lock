@@ -1,0 +1,2 @@
+# Verified linux/amd64, Python 3.12 dependency versions.
+torch==2.15.0+cpu

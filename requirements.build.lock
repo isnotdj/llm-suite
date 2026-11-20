@@ -1,0 +1,4 @@
+# Verified linux/amd64, Python 3.12 dependency versions.
+pip==26.3
+setuptools==84.2.1
+wheel==0.48.0

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "root": "/nas",
+  "datasets": {
+    "ceval": "a1/ceval-exam",
+    "logiqa-zh": "b2",
+    "mathbench": "c3/mathbench_v1",
+    "cmrc2018": "d4/random.json",
+    "longbench": "e5/data",
+    "finsafetybench": "f6/random.csv",
+    "financeiq": "g7",
+    "halluqa": "h8/random.json",
+    "followbench_en": "i9/data",
+    "followbench_zh": "i9/data_zh"
+  }
+}

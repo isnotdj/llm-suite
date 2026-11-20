@@ -1,0 +1,15 @@
+{
+  "project": "vllm-project/vllm",
+  "version": "v0.11.0",
+  "path": "vllm/benchmarks/lib/endpoint_request_func.py",
+  "source": "https://raw.githubusercontent.com/vllm-project/vllm/v0.11.0/vllm/benchmarks/lib/endpoint_request_func.py",
+  "sha256": "f3c482dcfa90297cc24b6667dfc8c4f8d43b6821d31f9ea61cc5095bf76f1fed",
+  "license": "Apache-2.0",
+  "modified": false,
+  "report": {
+    "path": "vllm/benchmarks/serve.py",
+    "source": "https://raw.githubusercontent.com/vllm-project/vllm/v0.11.0/vllm/benchmarks/serve.py",
+    "sha256": "5dcfbc9cb735450d9399cc65d7a7fecad8e9b841c5f7ea0fad90f0eb0b768d97",
+    "modified": false
+  }
+}

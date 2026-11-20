@@ -1,0 +1,29 @@
+[
+  {
+    "name": "ceval"
+  },
+  {
+    "name": "logiqa-zh"
+  },
+  {
+    "name": "mathbench"
+  },
+  {
+    "name": "cmrc2018"
+  },
+  {
+    "name": "longbench"
+  },
+  {
+    "name": "finsafetybench"
+  },
+  {
+    "name": "financeiq"
+  },
+  {
+    "name": "halluqa"
+  },
+  {
+    "name": "followbench"
+  }
+]

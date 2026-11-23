@@ -1,8 +1,10 @@
 *
 !Dockerfile
+!Dockerfile.native
 !datasets.json
 !scripts/
 !scripts/*.py
+!scripts/pip_with_secrets.sh
 !dataset-map.example.json
 !suite.example.json
 !README.md

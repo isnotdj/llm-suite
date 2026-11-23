@@ -9,3 +9,5 @@ cache/
 .env.*
 vllm-suite.zip
 .DS_Store
+
+vllm-suite-offline/

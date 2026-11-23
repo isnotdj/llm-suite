@@ -6,13 +6,13 @@ Ubuntu 24.04 / Python 3.12 镜像，以固定版本 OpenCompass 的数据加载�
 
 ## 安装
 
-在项目根目录执行以下命令。构建机需已安装 Docker 并启动 daemon（可用 `docker info` 检查），且能访问系统软件源、Python 包源、GitHub 和评分资源下载站点。目标部署平台为 Linux amd64；其他架构构建或运行此镜像需要相应仿真支持。宿主机不需要安装 Python、CUDA 或模型权重。
+在项目根目录执行以下命令。构建机需已安装支持 BuildKit 的 Docker 并启动 daemon（可用 `docker info` 检查），且能访问系统软件源、Python 包源、GitHub 和评分资源下载站点。目标部署平台为 Linux amd64；其他架构构建或运行此镜像需要相应仿真支持。宿主机不需要安装 Python、CUDA 或模型权重。
 
 ```bash
 docker build --platform linux/amd64 -t vllm-suite:opencompass .
 ```
 
-构建需要联网下载系统包、Python 依赖和官方评分代码。精度环境依赖版本由 `requirements.build.lock`、`requirements.cpu.lock` 和 `requirements.lock` 固定，独立性能环境由 `requirements.perf.lock` 固定；升级依赖时需更新对应锁文件并重新验证。系统包不保证逐字节可复现。镜像包含 CPU 版 PyTorch（精度框架依赖）、评分资源以及基础 shell/网络工具，不包含模型权重。HalluQA、FollowBench 上游仓库自带的小型数据随官方代码保留；其他数据放 NAS。
+构建需要联网下载系统包、Python 依赖和官方评分代码。精度环境依赖版本由 `requirements.build.lock`、`requirements.cpu.lock` 和 `requirements.lock` 固定，独立性能环境由 `requirements.perf.lock` 固定，原生 vLLM 环境由 `requirements.native.lock` 固定；升级依赖时需更新对应锁文件并重新验证。系统包不保证逐字节可复现。镜像包含 CPU 版 PyTorch（精度框架依赖）、评分资源以及基础 shell/网络工具，不包含模型权重。HalluQA、FollowBench 上游仓库自带的小型数据随官方代码保留；其他数据放 NAS。
 
 构建完成后先检查两个 Python 环境及离线评分资源：
 
@@ -38,6 +38,26 @@ gzip -dc vllm-suite-opencompass.tar.gz | docker load
 以上管道命令在 Bash 或 Zsh 中执行，`pipefail` 确保导出或导入任一步失败时返回非零退出码。导出失败的压缩包不能用于部署，应解决错误后重新导出。
 
 目标机器仍需安装并启动 Docker，同时拷贝所需配置文件（精度使用 `suite.local.json`、`datasets.local.json`；性能使用 `perf.local.json`），准备 NAS 数据及性能所需的 tokenizer，并创建本地 `outputs/`、`cache/` 目录。配置可在下文按示例生成。导入镜像后也应执行上面的离线检查。离线指无需下载依赖和数据；正式评测仍需网络连通目标 API 及所需的裁判 API，不要给正式评测添加 `--network none`。
+
+### 离线交付
+
+Python 锁文件以 Linux amd64、Python 3.12 为目标，解析时以 2026-05-01 00:00 UTC 为发布截止时间。两套常规环境分别使用独立锁文件。固定的 OpenCompass 原始依赖要求 `mmengine-lite==0.11.0rc3`，该版本晚于截止日期，镜像构建时将其约束调整为 `0.10.7`。原生 vLLM 0.11.0 环境另使用完整锁文件，Transformers 限定在 4.x。
+
+联网准备机可以把完整运行镜像打成离线包。准备机需要能访问系统包、Python 包、基础镜像和固定评分源码。常规镜像包含精度评测、分阶段压测、Python 运行时、依赖及评分资源，目标机加载后无需从包仓库安装。原生 vLLM 全参数压测使用单独的镜像。
+
+```bash
+# all 构建两个镜像，也可选 suite 或 native
+./scripts/package_offline.sh ./vllm-suite-offline all
+# 将整个 vllm-suite-offline 目录复制到目标机
+cd vllm-suite-offline
+./load_offline.sh
+```
+
+已有镜像时可设置 `VLLM_SUITE_USE_EXISTING=1` 跳过构建，脚本会检查镜像架构；使用前请确认镜像对应需要交付的源码与依赖版本。构建机使用内部 Python 仓库时，可设置 `PIP_INDEX_URL` 和 `TORCH_INDEX_URL` 环境变量供打包脚本传入。构建必须启用 Docker BuildKit 和 Docker Buildx。脚本通过 BuildKit secret 将这两个变量传给构建过程，地址可包含认证信息。使用 secret 时，依赖安装输出会被隐藏，避免私有地址出现在构建日志。直接构建时使用 `DOCKER_BUILDKIT=1 docker build --secret id=pip_index_url,env=PIP_INDEX_URL`，需要 CPU PyTorch 镜像源时另外传入 `--secret id=torch_index_url,env=TORCH_INDEX_URL`。请同时准备基础镜像、系统包和评分资源的访问途径。
+
+导入脚本先核对 `SHA256SUMS`，再导入清单中的镜像。包内的 `*.example.json` 是配置模板，按实际 API 和 NAS 路径复制编辑。NAS 中的已有 tokenizer 与数据不打入镜像，使用只读挂载；运行结果写入目标机本地磁盘。
+
+该打包流程在准备机联网构建镜像。如果构建机也只能访问内部源，需要内部系统包源、Python 包源、基础镜像和评分资源镜像；本项目未验证内部仓库包含这些锁定版本。Python 锁文件不固定 APT 包与原生基础镜像的传递依赖，完整依赖以实际构建的镜像及其校验值为准。
 
 ## 准备 NAS 数据
 
@@ -236,7 +256,7 @@ docker run --rm --network none vllm-suite:opencompass python /opt/evaluation/scr
 # 构建机，目标平台为 Linux amd64
 set -o pipefail
 docker build --platform linux/amd64 -t vllm-suite:opencompass .
-docker build --platform linux/amd64 --target native-bench -t vllm-suite:native-bench .
+docker build --platform linux/amd64 -f Dockerfile.native -t vllm-suite:native-bench .
 docker save vllm-suite:opencompass vllm-suite:native-bench | gzip > vllm-suite-images.tar.gz
 # 同步 perf.local.json、perf.native.local.json 和镜像包到目标机
 # 目标机
@@ -316,13 +336,13 @@ export TARGET_API_KEY='你的目标API密钥'
 
 字段名去掉 CLI 选项的开头 `--`，连字符或下划线均可。开关写 JSON 布尔值，多值参数写字符串数组，例如 `"goodput": ["ttft:2000", "tpot:50"]`。字典参数可写 JSON 对象，例如 `"random_mm_limit_mm_per_prompt": {"image": 2}`。无限请求率写 `"request_rate": "inf"`。未填写的参数沿用 vLLM 0.11.0 默认值（原生 seed 默认为 0）。完整选项由该版本的官方 parser 提供，未知参数会报错。OpenAI 兼容服务的 `base_url` 填主机和端口，完整 API 路径填入 `endpoint`。认证通过 `OPENAI_API_KEY` 环境变量传入。
 
-原生模式需要完整 vLLM 客户端环境。可用项目提供的独立镜像目标构建和运行，容器中的 tokenizer 路径与 NAS 挂载位置需对应。
+原生模式需要完整 vLLM 客户端环境。可用项目提供的 Dockerfile.native 构建并运行，容器中的 tokenizer 路径与 NAS 挂载位置需对应。
 
 ```bash
 cp perf.native.example.json perf.native.local.json
 # 编辑模型、地址和 NAS 上的实际 tokenizer 路径
 mkdir -p outputs
-docker build --platform linux/amd64 --target native-bench -t vllm-suite:native-bench .
+docker build --platform linux/amd64 -f Dockerfile.native -t vllm-suite:native-bench .
 docker run --rm --network none -v /实际NAS路径:/nas:ro -v "$PWD":/config:ro -v "$PWD/outputs":/outputs \
   vllm-suite:native-bench --config /config/perf.native.local.json --output /outputs/native-check --validate-only
 docker run --rm -e OPENAI_API_KEY -e HF_HUB_OFFLINE=1 \

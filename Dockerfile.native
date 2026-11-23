@@ -1,0 +1,11 @@
+FROM vllm/vllm-openai:v0.11.0
+COPY scripts/pip_with_secrets.sh /usr/local/bin/pip-with-secrets
+COPY requirements.native.lock /opt/evaluation/requirements.native.lock
+RUN --mount=type=secret,id=pip_index_url pip-with-secrets python3 -m pip install --no-cache-dir --no-deps -r /opt/evaluation/requirements.native.lock \
+    && python3 -m pip check
+COPY scripts/ /opt/evaluation/scripts/
+COPY perf.native.example.json /opt/evaluation/
+RUN HF_HUB_OFFLINE=1 python3 /opt/evaluation/scripts/run_perf.py \
+    --config /opt/evaluation/perf.native.example.json --output /tmp/native-parser-check --validate-only
+ENTRYPOINT ["python3", "/opt/evaluation/scripts/run_perf.py"]
+CMD ["--help"]

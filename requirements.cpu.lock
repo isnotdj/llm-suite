@@ -1,2 +1,2 @@
-# Verified linux/amd64, Python 3.12 dependency versions.
-torch==2.15.0+cpu
+# Linux amd64 CPU; released before 2026-05-01 UTC.
+torch==2.10.0+cpu

@@ -1,4 +1,4 @@
-# Verified linux/amd64, Python 3.12 dependency versions.
-pip==26.3
-setuptools==84.2.1
-wheel==0.48.0
+# Released before 2026-05-01 UTC.
+pip==26.1
+setuptools==82.0.1
+wheel==0.47.0

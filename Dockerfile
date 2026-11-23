@@ -1,12 +1,3 @@
-FROM vllm/vllm-openai:v0.11.0 AS native-bench
-RUN python3 -m pip install --no-cache-dir 'vllm[bench]==0.11.0'
-COPY scripts/ /opt/evaluation/scripts/
-COPY perf.native.example.json /opt/evaluation/
-RUN HF_HUB_OFFLINE=1 python3 /opt/evaluation/scripts/run_perf.py \
-    --config /opt/evaluation/perf.native.example.json --output /tmp/native-parser-check --validate-only
-ENTRYPOINT ["python3", "/opt/evaluation/scripts/run_perf.py"]
-CMD ["--help"]
-
 FROM ubuntu:24.04
 
 LABEL org.opencontainers.image.title="vllm-suite" \
@@ -14,8 +5,6 @@ LABEL org.opencontainers.image.title="vllm-suite" \
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG OPENCOMPASS_REV=f9d399363b4e00dbd5ada33096ca270969310274
-ARG PIP_INDEX_URL=https://pypi.org/simple
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ARG FOLLOWBENCH_REV=6278f4c1377b4eafab737267b8b21acd52ea0e52
 ARG HALLUQA_REV=7e5c67398d7fee013c37ec1d6afafa76f9836180
 
@@ -42,16 +31,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3.12 -m venv /opt/venv
 
 COPY requirements.build.lock requirements.cpu.lock requirements.lock /opt/evaluation/
-RUN python -m pip install --no-cache-dir --no-deps -r /opt/evaluation/requirements.build.lock
+COPY scripts/pip_with_secrets.sh /usr/local/bin/pip-with-secrets
+RUN --mount=type=secret,id=pip_index_url pip-with-secrets python -m pip install --no-cache-dir --no-deps -r /opt/evaluation/requirements.build.lock
 
 # Remote-only execution; CPU torch is required by OpenCompass utilities.
-RUN mkdir -p /opt/benchmarks/OpenCompass \
+RUN --mount=type=secret,id=pip_index_url --mount=type=secret,id=torch_index_url mkdir -p /opt/benchmarks/OpenCompass \
     && curl -fL --retry 3 "https://codeload.github.com/open-compass/opencompass/tar.gz/${OPENCOMPASS_REV}" | tar -xz --strip-components=1 -C /opt/benchmarks/OpenCompass \
     && echo "${OPENCOMPASS_REV}" > /opt/benchmarks/OpenCompass/REVISION \
-    && sed -i '/^-e git+/c\rouge-chinese==1.0.3' /opt/benchmarks/OpenCompass/requirements/runtime.txt \
-    && python -m pip install --no-cache-dir --no-deps -r /opt/evaluation/requirements.cpu.lock --index-url "${TORCH_INDEX_URL}"
-RUN python -m pip install --no-cache-dir --no-deps --no-build-isolation -r /opt/evaluation/requirements.lock \
-    && python -m pip install --no-cache-dir --no-deps --no-build-isolation /opt/benchmarks/OpenCompass \
+    && sed -i -e '/^-e git+/c\rouge-chinese==1.0.3' -e 's/^mmengine-lite==0.11.0rc3$/mmengine-lite==0.10.7/' /opt/benchmarks/OpenCompass/requirements/runtime.txt \
+    && torch_index=https://download.pytorch.org/whl/cpu \
+    && if [ -r /run/secrets/torch_index_url ]; then torch_index="$(cat /run/secrets/torch_index_url)"; fi \
+    && pip-with-secrets python -m pip install --no-cache-dir --no-deps -r /opt/evaluation/requirements.cpu.lock --index-url "$torch_index"
+RUN --mount=type=secret,id=pip_index_url pip-with-secrets python -m pip install --no-cache-dir --no-deps --no-build-isolation -r /opt/evaluation/requirements.lock \
+    && pip-with-secrets python -m pip install --no-cache-dir --no-deps --no-build-isolation /opt/benchmarks/OpenCompass \
     && python -m pip check
 
 RUN NLTK_ALLOW_PROXIED_URLOPEN=1 python -c "import nltk; [nltk.download(r, download_dir='/opt/data/nltk', raise_on_error=True) for r in ('punkt', 'punkt_tab', 'stopwords', 'averaged_perceptron_tagger_eng', 'wordnet', 'omw-1.4')]"
@@ -93,8 +85,8 @@ CMD ["bash"]
 
 # Independent CPU-only benchmark client; no vLLM serving engine/CUDA install.
 COPY requirements.perf.lock perf.example.json /opt/evaluation/
-RUN python3.12 -m venv /opt/perf-venv \
-    && /opt/perf-venv/bin/pip install --no-cache-dir -r /opt/evaluation/requirements.perf.lock \
+RUN --mount=type=secret,id=pip_index_url python3.12 -m venv /opt/perf-venv \
+    && pip-with-secrets /opt/perf-venv/bin/pip install --no-cache-dir -r /opt/evaluation/requirements.perf.lock \
     && /opt/perf-venv/bin/pip check \
     && chmod +x /opt/evaluation/scripts/run_perf.py \
     && ln -s /opt/evaluation/scripts/run_perf.py /usr/local/bin/perf-suite \

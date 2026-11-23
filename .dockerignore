@@ -6,6 +6,8 @@
 !dataset-map.example.json
 !suite.example.json
 !README.md
+!docs/
+!docs/full-accuracy-evaluation.md
 !requirements*.lock
 !perf.example.json
 !scripts/perf_vendor/

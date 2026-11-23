@@ -62,6 +62,7 @@ WORKDIR /opt/evaluation
 COPY datasets.json /opt/evaluation/datasets.json
 COPY scripts/ /opt/evaluation/scripts/
 COPY dataset-map.example.json suite.example.json README.md /opt/evaluation/
+COPY docs/ /opt/evaluation/docs/
 RUN chmod +x scripts/dataset_path.py scripts/run_suite.py \
     && ln -s /opt/evaluation/scripts/dataset_path.py /usr/local/bin/dataset-path \
     && ln -s /opt/evaluation/scripts/run_suite.py /usr/local/bin/eval-suite

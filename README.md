@@ -41,6 +41,8 @@ gzip -dc vllm-suite-opencompass.tar.gz | docker load
 
 ## 准备 NAS 数据
 
+从下载全部数据到启动容器和查看结果，请参阅[全量精度评测操作指南](docs/full-accuracy-evaluation.md)。
+
 复制 `dataset-map.example.json` 为 `datasets.local.json`。`root` 是容器内 NAS 挂载点；逻辑名称固定，右侧目录或文件名称可任意修改。例如：
 
 ```bash

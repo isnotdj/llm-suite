@@ -1,5 +1,6 @@
 """Run JSON-configured benchmarks with the pinned upstream serving CLI."""
 import argparse
+import hashlib
 from contextlib import contextmanager, redirect_stdout
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -10,6 +11,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
+from perf_resources import artifact_signature
 from run_journal import atomic_json
 
 
@@ -58,7 +60,65 @@ def parse_options(parser, options):
     return parser.parse_args(argv)
 
 
-def run_native(raw, root, stage, validate_only, summary):
+def connection_argv(api_url, argv):
+    """Apply model defaults to one complete workload, keeping explicit CLI options last."""
+    flags = {token.partition('=')[0] for token in argv}
+    api_url = api_url.rstrip('/')
+    base = api_url.removesuffix('/v1')
+    if flags & {'--host', '--port'}:
+        if '--base-url' in flags:
+            raise ValueError('Choose either --base-url or --host/--port for a benchmark workload')
+        return ['--endpoint', urlsplit(api_url).path + '/chat/completions', *argv]
+    defaults = ['--endpoint', api_url[len(base):] + '/chat/completions']
+    if '--base-url' not in flags:
+        defaults.extend(['--base-url', base])
+    return defaults + argv
+
+
+def prepare_argv_config(raw):
+    """Parse each complete argv with the installed official parser, before creating outputs."""
+    from vllm.benchmarks import serve
+    from perf_native_stages import options
+
+    parser = argparse.ArgumentParser(prog='vllm bench serve', allow_abbrev=False)
+    serve.add_cli_args(parser)
+    base = raw.pop('bench')
+    model_api_url = raw.pop('model_api_url', None)
+
+    def parse(argv, staged):
+        if model_api_url is not None:
+            argv = connection_argv(model_api_url, argv)
+        if staged:
+            options({token.partition('=')[0][2:]: True for token in argv if token.startswith('--')})
+        try:
+            namespace = parser.parse_args(argv)
+        except SystemExit as exc:
+            raise ValueError('Invalid benchmark arguments') from exc
+        # Only expose the fields used by stage planning, input binding and redaction.
+        fields = ('model', 'tokenizer', 'dataset_path', 'dataset_name', 'header', 'lora_modules',
+                  'prefix_repetition_num_prefixes', 'percentile_metrics', 'metric_percentiles',
+                  'backend', 'endpoint', 'endpoint_type', 'random_batch_size', 'trust_remote_code', 'hf_name')
+        return {**{k: getattr(namespace, k) for k in fields if getattr(namespace, k, None) is not None},
+                '_namespace': namespace}
+
+    if 'profiles' not in raw:
+        return {'vllm_bench_serve': dict(parse(base, False), _single=True)}
+    profiles = [dict(name=p['name'], vllm_bench_serve=parse(base + p['bench'], True))
+                for p in raw.pop('profiles')]
+    return dict(raw, profiles=profiles, vllm_bench_serve={})
+
+
+def result_metrics(result):
+    return {key: result[key] for key in ('output_throughput', 'p95_ttft_ms', 'p95_tpot_ms') if key in result}
+
+
+def count_checksum(summary):
+    # Compact official output omits output_lens. Bind observed counts to this result and round.
+    payload = [summary['run_id'], summary['sequence'], summary['artifact_signatures']['result'], summary['requests']]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def run_native(raw, root, stage, validate_only, summary, *, measured_count=None):
     if set(raw) != {'vllm_bench_serve'} or stage != 'all':
         raise ValueError('Use vllm_bench_serve alone, without suite fields or --stage')
     try:
@@ -72,13 +132,53 @@ def run_native(raw, root, stage, validate_only, summary):
     parser = argparse.ArgumentParser(prog='vllm bench serve', allow_abbrev=False)
     serve.add_cli_args(parser)
     try:
-        args = parse_options(parser, raw['vllm_bench_serve'])
+        from copy import copy
+        opts = raw['vllm_bench_serve']
+        if '_namespace' in opts:
+            args = copy(opts['_namespace'])
+            for key, value in opts.items():
+                if not key.startswith('_'):
+                    setattr(args, key, float(value) if key == 'request_rate' else value)
+        else:
+            args = parse_options(parser, opts)
     except SystemExit as exc:
         raise ValueError('Invalid vllm_bench_serve options (see parser diagnostic)') from exc
+    if not args.burstiness > 0:
+        raise ValueError('vllm_bench_serve.burstiness must be positive')
+    if getattr(args, 'dataset_name', None) == 'random-mm' and args.backend != 'openai-chat':
+        raise ValueError('random-mm requires the openai-chat backend')
+    for item in getattr(args, 'metadata', None) or []:
+        if '=' not in item or not item.partition('=')[0].strip():
+            raise ValueError('vllm_bench_serve.metadata requires KEY=VALUE')
+    if getattr(args, 'goodput', None):
+        serve.check_goodput_args(args)
     export_dir = Path(args.result_dir or '.')
-    if export_dir.is_absolute() or '..' in export_dir.parts:
-        raise ValueError('result_dir must be a relative directory inside this run’s exports/')
-    args.result_dir = str(root/'exports'/export_dir)
+    export = bool(args.save_result or args.append_result)
+    export_name = export_filename(args) if export or args.result_filename is not None else None
+    single = opts.get('_single', False)
+    if single:
+        from run_inputs import check_output, require_local_output
+        directory = (root/export_dir).resolve()
+        if export:
+            inputs = json.loads(os.environ.get('VLLM_SUITE_INPUTS', '[]'))
+            inputs.extend([args.dataset_path, args.tokenizer, args.model, *(args.lora_modules or [])])
+            check_output(directory, inputs)
+            require_local_output(directory)
+            if not directory.is_relative_to(root):
+                raise ValueError('result_dir must be inside this run’s perf directory')
+            reserved = {root/name for name in ('setup.json', 'summary.json', 'vllm-result.json',
+                                                'vllm-report.txt', '.report-rebuild.lock')}
+            if any(directory.is_relative_to(path) for path in reserved):
+                raise ValueError('Native export directory collides with a suite artifact')
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for path in [directory/export_name, (directory/export_name).with_suffix('.pytorch.json')]:
+                if path in reserved or path.is_symlink() or path.exists():
+                    raise ValueError(f'Native export destination is reserved or already exists: {path}')
+        args.result_dir = str(directory)
+    else:
+        if export_dir.is_absolute() or '..' in export_dir.parts:
+            raise ValueError('result_dir must be a relative directory inside this run’s exports/')
+        args.result_dir = str(root/'exports'/export_dir)
     dataset_path = getattr(args, 'dataset_path', None)
     source = None
     if dataset_path and Path(dataset_path).exists():
@@ -99,24 +199,25 @@ def run_native(raw, root, stage, validate_only, summary):
     setup = dict(mode='vllm_bench_serve', vllm_version=installed, api_key_env='OPENAI_API_KEY',
                  options=options)
     atomic_json(root/'setup.json', setup)
-    export = bool(args.save_result or args.append_result)
     counts = dict(selected=None, dispatched=0, successful=0)
     artifacts = dict(report='not_generated', result='not_generated',
                      export='not_generated' if export else 'not_requested')
     summary.update(requests=counts, artifacts=artifacts, traffic_status='not_started')
-    if export or args.result_filename is not None:
-        export_name = export_filename(args)
     if validate_only:
         return 'validated'
 
     summary.update(overall_status='running', traffic_status='running')
-    atomic_json(root/'summary.json', summary)
+    checkpoint = summary
+    if measured_count is not None:
+        summary['request_count_status'] = 'unknown'
+        checkpoint = dict(summary, requests=dict(selected=None, dispatched=None, successful=None))
+    atomic_json(root/'summary.json', checkpoint)
     report = NativeReport(root, artifacts)
     # The pinned CLI writes optional exports after printing the table. Run its
     # measurement once, persist the return value, then perform that export.
     args.save_result = args.append_result = False
     try:
-        with observe_requests(serve, counts, root, summary), redirect_stdout(report):
+        with observe_requests(serve, counts, root, summary, measured_count), redirect_stdout(report):
             result = serve.main(args)
     finally:
         report.close()
@@ -139,18 +240,37 @@ def run_native(raw, root, stage, validate_only, summary):
     artifacts['result'] = 'failed'
     atomic_json(root/'vllm-result.json', result)
     artifacts['result'] = 'complete'
-    if export:
-        artifacts['export'] = 'failed'
-        # Claim a fresh, private tree. Never reuse a directory or follow an
-        # existing export tree, even when append_result was requested.
-        (root/'exports').mkdir(mode=0o700)
-        path = Path(args.result_dir)/export_name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        export_result(serve, path, result, options)
-        artifacts['export'] = 'complete'
-        summary['export_path'] = str(path)
     if not consistent:
         raise ValueError('vLLM request counts could not be reconciled')
+    if measured_count is not None:
+        summary['metrics'] = result_metrics(result)
+        summary['artifact_signatures'] = {key: artifact_signature(root/filename) for key, filename in
+                                          [('report', 'vllm-report.txt'), ('result', 'vllm-result.json')]}
+        summary['count_sha256'] = count_checksum(summary)
+        summary['request_count_status'] = 'final'
+    if measured_count is not None or single:
+        summary['measurement_status'] = traffic_status
+        summary['overall_status'] = 'export_pending' if export else traffic_status
+        artifacts['export'] = 'pending' if export else 'not_requested'
+        atomic_json(root/'summary.json', summary)
+    if export:
+        artifacts['export'] = 'failed'
+        if single:
+            summary['export_dir'] = args.result_dir
+        else:
+            (root/'exports').mkdir(mode=0o700)
+        path = Path(args.result_dir)/export_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        files = export_result(serve, path, result, options)
+        if measured_count is not None:
+            summary['export_files'] = {str(f.relative_to(root)): artifact_signature(f) for f in files}
+        artifacts['export'] = 'complete'
+        summary['export_path'] = str(path)
+    if measured_count is not None:
+        if export:
+            summary['overall_status'] = traffic_status
+            atomic_json(root/'summary.json', summary)
+        return traffic_status
     if not successful:
         raise ValueError('No successful measured requests')
     return traffic_status
@@ -168,15 +288,30 @@ def portable(value):
 
 
 @contextmanager
-def observe_requests(serve, counts, root, summary):
+def observe_requests(serve, counts, root, summary, measured_count=None):
     # Pinned v0.11.0 sends pbar (even when None) only on measured dispatches.
     # Readiness and start/stop-profiler calls bypass the measured semaphore.
     get_samples = serve.get_samples
     backends = serve.ASYNC_REQUEST_FUNCS
+    # Upstream removes output_lens from compact JSON after computing its report.
+    # Count the lengths it actually used for TPOT before that optional removal.
+    if measured_count is not None:
+        benchmark = serve.benchmark
+
+        async def measured_benchmark(*args, **kwargs):
+            result = await benchmark(*args, **kwargs)
+            counts['tpot_samples'] = sum(length > 1 for length in result['output_lens'])
+            return result
+
     def selected(*args, **kwargs):
         samples = get_samples(*args, **kwargs)
         counts['selected'] = len(samples)
-        atomic_json(root/'summary.json', summary)
+        snapshot = summary
+        if measured_count is not None:
+            snapshot = dict(summary, requests=dict(selected=len(samples), dispatched=None, successful=None))
+        atomic_json(root/'summary.json', snapshot)
+        if measured_count is not None and len(samples) != measured_count:
+            raise ValueError(f'vLLM selected {len(samples)} requests; this stage requires {measured_count}')
         if not samples:
             raise ValueError('No benchmark requests selected')
         return samples
@@ -193,11 +328,15 @@ def observe_requests(serve, counts, root, summary):
         return request
 
     try:
+        if measured_count is not None:
+            serve.benchmark = measured_benchmark
         serve.get_samples = selected
         serve.ASYNC_REQUEST_FUNCS = {name: observe(fn) for name, fn in backends.items()}
         yield
     finally:
         serve.get_samples, serve.ASYNC_REQUEST_FUNCS = get_samples, backends
+        if measured_count is not None:
+            serve.benchmark = benchmark
 
 
 class NativeReport:
@@ -261,8 +400,12 @@ def export_result(serve, path, result, options):
         with staged.open('x', encoding='utf-8') as stream:
             json.dump(result, stream)
         os.link(staged, path)
+        published = [path]
         if os.environ.get('SAVE_TO_PYTORCH_BENCHMARK_FORMAT'):
             serve.save_to_pytorch_benchmark_format(argparse.Namespace(**options), result, str(staged))
             sidecar = staged.with_suffix('.pytorch.json')
             if sidecar.is_file():
-                os.link(sidecar, path.with_suffix('.pytorch.json'))
+                destination = path.with_suffix('.pytorch.json')
+                os.link(sidecar, destination)
+                published.append(destination)
+        return published

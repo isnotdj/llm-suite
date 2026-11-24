@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "root": "/nas",
+  "datasets": {
+    "ceval": "ceval-exam",
+    "logiqa-zh": "logiqa-zh",
+    "mathbench": "mathbench_v1",
+    "cmrc2018": "cmrc2018/cmrc2018_dev.json",
+    "longbench": "longbench/data",
+    "finsafetybench": "finsafetybench/FinsafetyBenchmark.csv",
+    "financeiq": "financeiq",
+    "halluqa": "/opt/benchmarks/HalluQA/HalluQA.json",
+    "followbench_en": "/opt/benchmarks/FollowBench/data",
+    "followbench_zh": "/opt/benchmarks/FollowBench/data_zh"
+  }
+}

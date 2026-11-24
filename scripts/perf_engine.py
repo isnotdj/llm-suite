@@ -6,6 +6,7 @@ import json
 import resource
 import sys
 import time
+from perf_native_report import REPORT_CONTRACT_VERSION
 from perf_metrics import metrics, qualifies, MetricStore, HEALTH_POLICY
 
 
@@ -65,9 +66,12 @@ class LoopLagMonitor:
 
 
 async def load(transport, samples, concurrency, duration, max_duration, min_requests,
-               config, folder, label, slo, guard=False):
+               config, folder, label, slo, guard=False, *, request_limit=None, check_stop=None):
     folder.mkdir(parents=True,exist_ok=True)
     started = time.perf_counter()
+    hard_deadline = started + max_duration
+    target_deadline = min(started + duration, hard_deadline)
+    deadline = None if request_limit is not None else (hard_deadline if min_requests else target_deadline)
     rows = MetricStore(folder/(label+'.metrics.sqlite'))
     windows, interval = [], []
     health = FailureGuard(started, config['timing']['no_success'])
@@ -100,19 +104,31 @@ async def load(transport, samples, concurrency, duration, max_duration, min_requ
         interval, window_start, cpu_start, lag = [], now, time.process_time(), []
 
     async def worker():
-        nonlocal counter
+        nonlocal counter, dispatch_end, deadline
         while not stop.is_set():
+            if deadline is not None and time.perf_counter() >= deadline:
+                dispatch_end = deadline
+                stop.set()
+                break
+            if check_stop: await check_stop()
             index = counter
             counter += 1
+            if counter == request_limit:
+                dispatch_end = time.perf_counter()
+                stop.set()
             row = await transport(samples[index % len(samples)])
-            row.update(sequence=index, phase=label)
+            row.update(sequence=index, profile=folder.name, phase=label)
             rows.append(row)
+            if deadline is not None and len(rows) == min_requests:
+                deadline = min(hard_deadline, max(target_deadline, time.perf_counter()))
             # Full native text/ITL stays on disk, not in minute-long windows.
             interval.append({k:v for k,v in row.items() if k not in ('native_output','error')})
             if guard: health.observe(row)
             encoded = (json.dumps(row)+'\n').encode('utf-8')
             log.write(encoded);log.flush()
             log_hash.update(encoded)
+            if request_limit == concurrency:
+                return  # Each worker owns one request in a single burst.
             # Even an immediately failing mock/client must yield to the watchdog.
             await asyncio.sleep(0)
 
@@ -120,27 +136,37 @@ async def load(transport, samples, concurrency, duration, max_duration, min_requ
     monitor_task = asyncio.create_task(monitor.run())
     workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
     try:
-        while not stop.is_set():
-            await asyncio.sleep(min(.25,window_seconds))
+        pending = set(workers)
+        while pending:
             now = time.perf_counter()
-            for task in workers:
-                if task.done() and task.exception(): raise task.exception()
-            elapsed = now-started
-            if guard:
-                guard_state = health.evaluate(now,getattr(transport,'last_progress',started))
-                aborted = guard_state['reason']
-            if aborted or elapsed >= max_duration or (elapsed >= duration and len(rows)>=min_requests):
-                stop.set(); dispatch_end = now
-            if now-window_start >= window_seconds: flush_window(now)
-        # Complete in-flight requests. Each transport has its own finite timeout.
-        await asyncio.gather(*workers)
+            wake_at = min(now + .25, window_start + window_seconds)
+            if deadline is not None and not stop.is_set():
+                wake_at = min(wake_at, deadline)
+            done, pending = await asyncio.wait(pending, timeout=max(0, wake_at - now),
+                                               return_when=asyncio.FIRST_EXCEPTION)
+            for task in done:
+                task.result()
+            now = time.perf_counter()
+            if not stop.is_set():
+                if guard:
+                    guard_state = health.evaluate(now, getattr(transport, 'last_progress', started))
+                    aborted = guard_state['reason']
+                timed_out = deadline is not None and now >= deadline
+                if aborted or timed_out:
+                    stop.set()
+                    dispatch_end = deadline if timed_out else now
+            # Keep writing windows during drain. The final partial window is closed below.
+            if pending and now - window_start >= window_seconds:
+                flush_window(now)
+        ended = time.perf_counter()
         completed = True
     finally:
         stop.set()
         for task in workers:
             if not task.done(): task.cancel()
         await asyncio.gather(*workers,return_exceptions=True)
-        ended = time.perf_counter()
+        if not completed:
+            ended = time.perf_counter()
         monitor.sample()
         monitor_task.cancel()
         await asyncio.gather(monitor_task,return_exceptions=True)
@@ -151,14 +177,19 @@ async def load(transport, samples, concurrency, duration, max_duration, min_requ
     aggregate = rows.summary(elapsed)
     count = len(rows)
     rows.close()
+    if request_limit is not None and counter != request_limit:
+        raise ValueError(f'{label}: expected {request_limit} dispatched requests, got {counter}')
     if counter != count:
         raise ValueError(f'{label}: dispatched {counter} requests but recorded {count}')
     result = dict(concurrency=concurrency,metrics=aggregate,
-        report_contract=dict(version=1,token_count_version=1,requests_sha256=log_hash.hexdigest()),
-        sufficient=count>=min_requests and (dispatch_end-started)>=duration,
+        report_contract=dict(version=REPORT_CONTRACT_VERSION, token_count_version=1,
+                             profile=folder.name, phase=label, requests_sha256=log_hash.hexdigest()),
+        sufficient=count>=min_requests and dispatch_end>=started+duration,
         aborted=aborted, guard=guard_state, duration=elapsed, dispatch_seconds=dispatch_end-started,
         drain_seconds=ended-dispatch_end, windows=windows,
         client_bottleneck_suspected=any(w['event_loop_lag_max']>.1 for w in windows),
         requests_file=label+'.requests.jsonl', windows_file=label+'.windows.jsonl')
+    if request_limit is not None:
+        result['request_limit'] = request_limit
     result['slo_pass'] = qualifies(result['metrics'],slo)
     return result

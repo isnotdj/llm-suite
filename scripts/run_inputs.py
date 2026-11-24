@@ -66,23 +66,43 @@ def require_local_output(path):
         existing = path
         while not existing.exists():
             existing = existing.parent
-        fs_type = subprocess.check_output(['stat','-f','%T',str(existing)],text=True).strip()
+        try:
+            info = subprocess.check_output(['/bin/df', '--libxo', 'json', '-Y', str(existing)])
+            volume, = json.loads(info)['storage-system-information']['filesystem']
+            fs_type = volume['type']
+            if not isinstance(fs_type, str) or not fs_type.strip():
+                raise ValueError('missing filesystem type')
+        except (OSError, subprocess.CalledProcessError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f'Cannot determine output filesystem type for {existing}') from exc
     else:
         return
     if fs_type.lower() in {'nfs','nfs4','cifs','smbfs','smb3','afpfs','sshfs','fuse.sshfs','9p','ceph','glusterfs','fuse.glusterfs'}:
         raise ValueError(f'Output directory must be on local storage: {path} ({fs_type})')
 
 
-def create_run(output, inputs):
+def create_run(output, inputs, *, group_id=None, phase=None, existing_group=False):
     from datetime import datetime
     from uuid import uuid4
 
     output = output.resolve()
     require_local_output(output)
-    check_output(output, inputs)
-    output.mkdir(parents=True, exist_ok=True)
-    name = datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f') + '-' + uuid4().hex[:8]
-    root = output/name
+    if group_id is None:
+        check_output(output, inputs)
+        output.mkdir(parents=True, exist_ok=True)
+        name = datetime.now().astimezone().strftime('%Y%m%d-%H%M%S-%f') + '-' + uuid4().hex[:8]
+        root = output/name
+    else:
+        group = output/str(group_id)
+        if group.is_symlink():
+            raise ValueError(f'Unexpected symbolic link for grouped run: {group}')
+        # Accuracy claims only its own leaf in an already reserved group.
+        check_output(group/phase if phase == 'accuracy' else group, inputs)
+        if phase == 'perf' and not existing_group:
+            group.mkdir(mode=0o700, parents=True, exist_ok=False)
+            print(f'Run group: {group}', flush=True)
+        elif phase not in ('accuracy', 'perf'):
+            raise ValueError(f'Unknown grouped run phase: {phase}')
+        root = group/phase
     root.mkdir()
     print(f'Run directory: {root}', flush=True)
     return root

@@ -5,8 +5,8 @@ import re
 from urllib.parse import urlsplit
 from perf_data import SOURCES
 
-DEFAULTS = dict(seed=42, sample_count=200, min_samples=20,
-    concurrency=[1,2,4,8,16,32,64,128], overload_cap=256,
+DEFAULTS = dict(seed=42, sample_count=200, min_samples=20, requests_per_concurrency=10,
+    concurrency=[1,2,4,8,16,32,64,128],
     slo={'ttft_ms':2000, 'tpot_ms':50},
     timing={'warmup':30, 'scan':120, 'scan_max':600, 'scan_requests':200,
             'overload':180, 'recovery':300, 'recovery_window':30,
@@ -29,7 +29,7 @@ def check_keys(value, allowed, path):
 
 
 def normalize(raw):
-    known = DEFAULTS.keys() | {'target','dataset','tokenizer','chat_template','context_window','max_generation_tokens'}
+    known = DEFAULTS.keys() | {'overload_cap','overload_concurrency','target','dataset','tokenizer','chat_template','context_window','max_generation_tokens'}
     unknown = raw.keys() - known
     if unknown:
         raise ValueError(f'Unknown suite fields: {sorted(unknown)}. Put native options in vllm_bench_serve.')
@@ -47,7 +47,7 @@ def normalize(raw):
     c.update(copy.deepcopy(raw))
     for key in ('slo','timing'):
         c[key] = {**DEFAULTS[key], **raw.get(key,{})}
-    for key in ('context_window','max_generation_tokens','sample_count','min_samples','overload_cap'):
+    for key in ('context_window','max_generation_tokens','sample_count','min_samples','requests_per_concurrency'):
         positive(c[key], key, True)
     c['timing'].setdefault('first_token_timeout', c['timing']['timeout'])
     c['timing'].setdefault('stream_idle_timeout', c['timing']['no_success'])
@@ -79,13 +79,31 @@ def normalize(raw):
     if not isinstance(temperature,(int,float)) or not math.isfinite(temperature) or temperature < 0: raise ValueError('Invalid temperature')
     if not c['concurrency'] or c['concurrency'] != sorted(set(c['concurrency'])): raise ValueError('concurrency must be increasing and unique')
     for n in c['concurrency']: positive(n,'concurrency',True)
+    if 'overload_cap' in c:
+        positive(c['overload_cap'], 'overload_cap', True)
+    if 'overload_concurrency' in c:
+        levels = c['overload_concurrency']
+        if not isinstance(levels, list) or not levels:
+            raise ValueError('overload_concurrency must be a nonempty list of positive integers')
+        for level in levels:
+            positive(level, 'overload_concurrency', True)
+        if len(set(levels)) != len(levels):
+            raise ValueError('overload_concurrency contains duplicate levels')
+        if 'overload_cap' in c and max(levels) > c['overload_cap']:
+            raise ValueError('overload_concurrency exceeds overload_cap')
     for k,v in c['timing'].items(): positive(v,k, k=='scan_requests')
     if c['timing']['scan_max'] < c['timing']['scan']: raise ValueError('scan_max < scan')
-    seen = set()
+    seen = {}
     for p in c['profiles']:
-        if p['name'] == 'inputs': raise ValueError('Profile name inputs is reserved for frozen samples')
-        if not re.fullmatch(r'[A-Za-z0-9_-]+',p['name']) or p['name'] in seen: raise ValueError('Invalid/duplicate profile name')
-        seen.add(p['name'])
+        name = p.get('name')
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+            raise ValueError(f'Invalid profile name: {name!r}')
+        key = name.casefold()
+        if key == 'inputs':
+            raise ValueError(f'Profile name {name!r} conflicts with the reserved directory inputs')
+        if key in seen:
+            raise ValueError(f'Conflicting profile names: {seen[key]!r} and {name!r}')
+        seen[key] = name
         positive(p['input_tokens'],'input_tokens',True)
         if p.get('output_target') is not None: positive(p['output_target'],'output_target',True)
         p.setdefault('variation',0.1)

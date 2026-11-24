@@ -20,6 +20,7 @@ import tempfile
 
 from perf_resources import digest
 
+REPORT_CONTRACT_VERSION = 2
 PERCENTILES = (50, 95, 99)
 
 
@@ -61,6 +62,16 @@ def _distribution(db, key):
                 percentiles=[(p,quantile(p)) for p in PERCENTILES])
 
 
+def _scheduler(stage, phase):
+    if stage is None:
+        return 'unknown'
+    if 'request_limit' not in stage:
+        return 'vllm-suite duration-based closed loop'
+    if phase.startswith(('overload-', 'burst-')) and stage['request_limit'] == stage['concurrency']:
+        return 'single-pulse'
+    return 'fixed-request-count'
+
+
 def write_report(requests, prefix, duration, concurrency, tokenizer, config=None, *, stage=None):
     """Return artifact names. No HTTP calls; duration includes request drain."""
     requests, prefix = Path(requests), Path(prefix)
@@ -80,8 +91,15 @@ def write_report(requests, prefix, duration, concurrency, tokenizer, config=None
             contract = stage.get('report_contract') if stage is not None else None
             if stage is not None and (type(expected) is not int or expected < 0):
                 raise ValueError(f'{requests}: invalid expected request count')
-            if contract is not None and (contract['version'],contract['token_count_version']) != (1,1):
-                raise ValueError(f'{requests}: unsupported report contract')
+            profile, phase = prefix.parent.name, prefix.name
+            version = contract['version'] if contract is not None else None
+            require_identity = version == REPORT_CONTRACT_VERSION
+            if contract is not None:
+                if (type(version) is not int or version not in (1, REPORT_CONTRACT_VERSION)
+                        or type(contract['token_count_version']) is not int or contract['token_count_version'] != 1):
+                    raise ValueError(f'{requests}: unsupported report contract')
+                if require_identity and (contract.get('profile'), contract.get('phase')) != (profile, phase):
+                    raise ValueError(f'{requests}: stage identity conflicts with {profile}/{phase}')
             checksum = hashlib.sha256()
             observed = 0
             with requests.open('rb') as source:
@@ -89,6 +107,11 @@ def write_report(requests, prefix, duration, concurrency, tokenizer, config=None
                     if contract is not None:
                         checksum.update(line)
                     row=json.loads(line)
+                    if stage is not None:
+                        if (require_identity or 'phase' in row) and row.get('phase') != phase:
+                            raise ValueError(f'{requests}: phase mismatch at row {index}')
+                        if (require_identity or 'profile' in row) and row.get('profile') != profile:
+                            raise ValueError(f'{requests}: profile mismatch at row {index}')
                     if stage is not None and contract is None and (
                         'native_report_tokens' in row or 'native_report_token_source' in row
                     ):
@@ -175,7 +198,7 @@ def write_report(requests, prefix, duration, concurrency, tokenizer, config=None
             text_path.write_text(output.getvalue())
             json_path=prefix.with_name(prefix.name+'.vllm.json')
             metadata=dict(request_count_verified=expected is not None,sequence_verified=expected is not None,
-                          sha256_verified=contract is not None,vllm_version='v0.11.0',scheduler='vllm-suite duration-based closed loop',
+                          sha256_verified=contract is not None,vllm_version='v0.11.0',scheduler=_scheduler(stage, prefix.name),
                           source_requests=requests.name,adapter_timeout_outputs=synthetic,
                           percentiles=list(PERCENTILES),native_success_semantics=True,
                           request_order='dispatch sequence')

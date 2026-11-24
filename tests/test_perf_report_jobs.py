@@ -81,14 +81,14 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(historical.read_bytes(),original.read_bytes())
 
     async def test_interruption_persists_jobs_without_generating_reports(self):
-        from run_perf import execute
+        from legacy_perf import execute
         for interruption in (asyncio.CancelledError,KeyboardInterrupt):
             with self.subTest(interruption=interruption),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);config,summary,report=self.fixture(root)
                 async def interrupted(c,tokenizer,p,r,s,stage,reports):
                     reports.append(report)
                     raise interruption()
-                with patch('run_perf.execute_stages',side_effect=interrupted),patch('perf_native_report.write_report') as writer:
+                with patch('legacy_perf.execute_stages',side_effect=interrupted),patch('perf_native_report.write_report') as writer:
                     with self.assertRaises(interruption): await execute(config,None,{},root,summary,'all')
                 writer.assert_not_called()
                 self.assertEqual(summary['reporting_status'],'pending')
@@ -98,13 +98,13 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.loads((root/'summary.json').read_text())['reporting_status'],'pending')
 
     async def test_error_redacted_in_summary_and_job_manifest(self):
-        from run_perf import execute
+        from legacy_perf import execute
         with tempfile.TemporaryDirectory() as directory,patch.dict(os.environ,REPORT_TEST_KEY='dummy-report-credential'):
             root=Path(directory);config,summary,report=self.fixture(root)
             (root/'vllm-report.txt').write_text('previous complete report')
             (root/'vllm-reports.json').write_text('[]')
             async def completed(c,tokenizer,p,r,s,stage,reports): reports.append(report)
-            with patch('run_perf.execute_stages',side_effect=completed),patch('perf_native_report.write_report',side_effect=RuntimeError('failed: dummy-report-credential')):
+            with patch('legacy_perf.execute_stages',side_effect=completed),patch('perf_native_report.write_report',side_effect=RuntimeError('failed: dummy-report-credential')):
                 with self.assertRaises(RuntimeError): await execute(config,None,{},root,summary,'all')
             for name in ('summary.json','report-jobs.json'):
                 text=(root/name).read_text()
@@ -122,6 +122,8 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(main(['--report-only','--output',str(root)]),0)
             self.assertEqual((root/'vllm-report.txt').read_text(),first)
             self.assertEqual(first.count('Serving Benchmark Result'),1)
+            legacy = json.loads((root/'4k/scan-c1.vllm.json').read_text())
+            self.assertEqual(legacy['vllm_suite_metadata']['scheduler'], 'vllm-suite duration-based closed loop')
             summary=json.loads((root/'summary.json').read_text())
             self.assertEqual(summary['overall_status'],'interrupted')
             self.assertEqual(summary['reporting_status'],'complete')
@@ -149,7 +151,8 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
         from perf_report_jobs import generate_reports, save_jobs
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);config,summary,report=self.fixture(root)
-            second=dict(report[3],concurrency=2)
+            second=dict(report[3],concurrency=2,requests_file='scan-c2.requests.jsonl')
+            (root/'4k/scan-c2.requests.jsonl').write_bytes((root/'4k/scan-c1.requests.jsonl').read_bytes())
             (root/'4k/scan-c2.json').write_text(json.dumps(second))
             manifest=save_jobs(root,discover=True)
             old_index=[dict(profile='4k',phase='previous')]
@@ -212,6 +215,48 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads((root/new_entry['json']).read_bytes())['generated_texts'],['OK'])
             generate()
             self.assertEqual(summary['reporting_status'],'complete')
+
+    def test_report_only_signal_and_full_disk_at_publication_boundary(self):
+        import signal
+        from contextlib import redirect_stderr
+        import perf_report_jobs as jobs
+        from run_perf import main
+
+        for after_switch in (False, True):
+            with self.subTest(after_switch=after_switch), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+                root = Path(directory).resolve()
+                self.fixture(root)
+                args = ['--report-only', '--output', str(root)]
+                self.assertEqual(main(args), 0)
+                pointer = root/'.vllm-reports/current'
+                old = pointer.readlink()
+                full = False
+                link = jobs._link
+                write = jobs.atomic_json
+
+                def switch(path, target):
+                    nonlocal full
+                    if path == pointer:
+                        if after_switch:
+                            link(path, target)
+                        full = True
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        self.fail('Publication continued after SIGTERM')
+                    link(path, target)
+
+                def write_json(path, value):
+                    if full:
+                        raise OSError(28, 'No space left on device')
+                    write(path, value)
+
+                with patch.object(jobs, '_link', switch), patch.object(jobs, 'atomic_json', write_json), redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(main(args), 130)
+                self.assertIn(str(root/'report-jobs.json'), errors.getvalue())
+                self.assertIn('No space left on device', errors.getvalue())
+                self.assertEqual(pointer.readlink() != old, after_switch)
+                entry = json.loads((root/'vllm-reports.json').read_text())[0]
+                self.assertTrue((root/entry['json']).is_file())
+                self.assertEqual(main(args), 0)
 
     async def test_legacy_index_and_reports_survive_failed_migration(self):
         import perf_report_jobs as jobs
@@ -403,6 +448,78 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(path.read_text(),'{"previous":true}')
             self.assertEqual(path.stat().st_mode & 0o777,0o600)
             self.assertEqual(list(path.parent.iterdir()),[path])
+
+    def test_rebuild_rejects_cross_round_records_and_preserves_published_version(self):
+        import hashlib
+        from run_perf import main
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            _, summary, _ = self.fixture(root)
+            folder = root/'4k'
+            seed = json.loads((folder/'scan-c1.requests.jsonl').read_text())
+            (folder/'scan-c1.json').unlink()
+            (folder/'scan-c1.requests.jsonl').unlink()
+            args = ['--report-only', '--output', str(root)]
+            points = []
+            logs = []
+            for phase in ('overload-c1-r1', 'overload-c1-r2'):
+                row = dict(seed, profile='4k', phase=phase, native_report_tokens=2,
+                           native_report_token_source='usage')
+                row['native_output'] = dict(seed['native_output'], generated_text=phase)
+                raw = (json.dumps(row)+'\n').encode()
+                point = dict(concurrency=1, duration=1, request_limit=1, metrics={'requests': 1},
+                             requests_file=phase+'.requests.jsonl',
+                             report_contract=dict(version=2, token_count_version=1, profile='4k',
+                                                  phase=phase, requests_sha256=hashlib.sha256(raw).hexdigest()))
+                points.append(point)
+                logs.append(raw)
+                (folder/point['requests_file']).write_bytes(raw)
+                (folder/(phase+'.json')).write_text(json.dumps(point))
+            summary.update(report_contract_version=2, profiles={'4k': {'overload': points}})
+            summary_file = root/'summary.json'
+            summary_file.write_text(json.dumps(summary))
+            self.assertEqual(main(args), 0)
+            pointer = root/'.vllm-reports/current'
+            published = pointer.readlink()
+            report = folder/'overload-c1-r2.vllm.json'
+            before = report.read_bytes()
+            self.assertEqual(json.loads(before)['generated_texts'], ['overload-c1-r2'])
+
+            stage = folder/'overload-c1-r2.json'
+            log = folder/points[1]['requests_file']
+            for fault in ('swapped_record', 'summary_hash', 'orphan_profile', 'row_phase', 'concurrency', 'request_limit', 'metrics.requests'):
+                with self.subTest(fault=fault):
+                    current = json.loads(json.dumps(summary))
+                    second = json.loads(json.dumps(points[1]))
+                    log.write_bytes(logs[1])
+                    if fault == 'swapped_record':
+                        second = points[0]
+                    elif fault == 'summary_hash':
+                        current['profiles']['4k']['overload'][1]['report_contract']['requests_sha256'] = '0'*64
+                    else:
+                        # Crash after stage commit, before the summary checkpoint.
+                        current['profiles']['4k']['overload'].pop()
+                        if fault == 'orphan_profile':
+                            second['report_contract']['profile'] = '16k'
+                        elif fault in ('concurrency', 'request_limit'):
+                            second[fault] = 32
+                        elif fault == 'metrics.requests':
+                            second['metrics']['requests'] = 32
+                        else:
+                            log.write_bytes(logs[0])
+                            second['report_contract']['requests_sha256'] = hashlib.sha256(logs[0]).hexdigest()
+                    summary_file.write_text(json.dumps(current))
+                    stage.write_text(json.dumps(second))
+                    self.assertEqual(main(args), 1)
+                    self.assertEqual(pointer.readlink(), published)
+                    self.assertEqual(report.read_bytes(), before)
+                    self.assertIn('4k/overload-c1-r2.json', json.loads(summary_file.read_text())['errors'][-1]['detail'])
+            stage.write_text(json.dumps(points[1]))
+            log.write_bytes(logs[1])
+            self.assertEqual(main(args), 0)
+            rebuilt = json.loads(report.read_bytes())
+            self.assertEqual(rebuilt['generated_texts'], ['overload-c1-r2'])
+            self.assertEqual(rebuilt['vllm_suite_metadata']['scheduler'], 'single-pulse')
 
     async def test_sealed_log_rejects_damage_and_rebuilds_without_nas(self):
         import hashlib
@@ -619,6 +736,54 @@ class ReportJobs(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(main(cmd),1)
             self.assertEqual(index.read_bytes(),published)
             self.assertEqual(json.loads((root/'4k/scan-c1.vllm.json').read_text())['total_output_tokens'],1)
+
+    def test_summary_requires_every_recorded_point_even_without_queue(self):
+        from run_perf import main
+        for previous in (False, True):
+            with self.subTest(previous=previous), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+                root = Path(directory)
+                self.fixture(root)
+                args = ['--report-only', '--output', str(root)]
+                index = root/'vllm-reports.json'
+                if previous:
+                    self.assertEqual(main(args), 0)
+                    old = index.read_bytes()
+                    (root/'report-jobs.json').unlink()
+
+                path = root/'summary.json'
+                summary = json.loads(path.read_bytes())
+                state = summary['profiles']['4k']
+                source = state['scan'][0]
+                absent = {}
+                for kind, phase in [('scan', 'scan-c2'), ('overload', 'overload-c1-r1'),
+                                    ('burst', 'burst-c2'), ('soak', 'soak')]:
+                    result = dict(source, requests_file=phase+'.requests.jsonl')
+                    if kind == 'overload':
+                        result['request_limit'] = 1
+                    if kind == 'soak':
+                        state[kind] = result
+                    else:
+                        state.setdefault(kind, []).append(result)
+                    file = root/'4k'/result['requests_file']
+                    file.write_bytes((root/'4k'/source['requests_file']).read_bytes())
+                    absent[phase] = result
+                path.write_text(json.dumps(summary))
+
+                self.assertEqual(main(args), 1)
+                failed = json.loads(path.read_bytes())
+                self.assertEqual(failed['reporting_status'], 'failed')
+                for phase in absent:
+                    self.assertIn(f'4k/{phase}.json', failed['errors'][-1]['detail'])
+                if previous:
+                    self.assertEqual(index.read_bytes(), old)
+                else:
+                    self.assertFalse(index.exists())
+
+                for phase, result in absent.items():
+                    (root/'4k'/(phase+'.json')).write_text(json.dumps(result))
+                self.assertEqual(main(args), 0)
+                self.assertEqual({entry['phase'] for entry in json.loads(index.read_bytes())},
+                                 set(absent) | {'scan-c1'})
 
     async def test_unqueued_published_stage_cannot_disappear(self):
         from run_perf import main

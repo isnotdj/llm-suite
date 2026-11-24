@@ -1,4 +1,6 @@
 """HalluQA transport adapter. Official source and prompts remain unchanged."""
+from eval_concurrency import check_cancelled, records, write_records
+from run_journal import atomic_json
 import argparse
 import ast
 import hashlib
@@ -7,6 +9,11 @@ import os
 from pathlib import Path
 import random
 import time
+import traceback
+
+
+class JudgeFailure(ValueError):
+    """The judge request failed or returned invalid votes."""
 
 
 def official_prompt(path):
@@ -20,6 +27,7 @@ def official_prompt(path):
 def request(client, parameters, attempts=3, sleep=time.sleep):
     import openai
     for attempt in range(attempts):
+        check_cancelled()
         try:
             return client.chat.completions.create(**parameters)
         except (openai.APIConnectionError, openai.APITimeoutError, openai.APIStatusError) as exc:
@@ -32,14 +40,21 @@ def request(client, parameters, attempts=3, sleep=time.sleep):
 
 
 def judge(client, parameters, sleep=time.sleep):
+    import openai
     # Match official five votes and up to five attempts at a valid vote batch.
     for _ in range(5):
-        response = request(client, {**parameters, 'n': 5}, sleep=sleep)
-        votes = [c.message.content for c in response.choices]
-        if (len(votes) == 5 and all(v in ('是', '否') for v in votes)
-                and all(getattr(c, 'finish_reason', None) == 'stop' for c in response.choices)):
+        try:
+            response = request(client, {**parameters, 'n': 5}, sleep=sleep)
+        except openai.APIError as exc:
+            raise JudgeFailure('HalluQA judge request failed') from exc
+        choices = getattr(response, 'choices', None)
+        if not isinstance(choices, list) or len(choices) != 5:
+            continue
+        votes = [getattr(getattr(choice, 'message', None), 'content', None) for choice in choices]
+        if (all(vote in ('是', '否') for vote in votes)
+                and all(getattr(choice, 'finish_reason', None) in ('stop', 'length') for choice in choices)):
             return votes
-    raise ValueError('Judge failed to return exactly five valid 是/否 votes')
+    raise JudgeFailure('Judge failed to return exactly five valid 是/否 votes')
 
 
 def main():
@@ -49,10 +64,13 @@ def main():
     parser.add_argument('--judge-model', default=os.environ.get('JUDGE_MODEL'))
     parser.add_argument('--base-url', default=os.environ.get('OPENAI_BASE_URL'))
     parser.add_argument('--official-dir', type=Path, default=Path('/opt/benchmarks/HalluQA'))
+    parser.add_argument('--concurrency', type=int, default=1)
     parser.add_argument('--timeout', type=float, default=60)
     args = parser.parse_args()
     if not args.judge_model or not os.environ.get('OPENAI_API_KEY'):
         parser.error('JUDGE_MODEL/--judge-model and OPENAI_API_KEY are required')
+    if args.concurrency < 1:
+        parser.error('--concurrency must be positive')
     if args.timeout <= 0:
         parser.error('--timeout must be positive')
     from offline_runtime import configure
@@ -92,27 +110,41 @@ def main():
                    for p in (source, data_path, args.responses, Path(__file__))},
     }
     meta_path = args.output_dir / 'run.json'
-    meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
-    correct = 0
+    atomic_json(meta_path, metadata)
+    def judge_sample(item):
+        sample, messages = prompt(dict(item), resource)
+        votes = judge(client, dict(model=args.judge_model, messages=messages,
+                                  temperature=0, top_p=0.5, max_tokens=10))
+        hallucination = votes.count('是') > 2 or sample['response'] == ''
+        return {**sample, 'votes': votes, 'is_hallucination': hallucination}
+
     try:
-        with (args.output_dir / 'samples.jsonl').open('w') as out:
-            for item in data:
-                sample, messages = prompt(dict(item), resource)
-                votes = judge(client, dict(model=args.judge_model, messages=messages,
-                                          temperature=0, top_p=0.5, max_tokens=10))
-                hallucination = votes.count('是') > 2 or sample['response'] == ''
-                correct += not hallucination
-                out.write(json.dumps({**sample, 'votes': votes, 'is_hallucination': hallucination},
-                                     ensure_ascii=False) + '\n')
-                out.flush()
+        path = args.output_dir/'samples.jsonl'
+        write_records(path, judge_sample, data, args.concurrency, len(data))
+        correct = sum(not record['is_hallucination'] for record in records(path))
         metadata.update(status='complete', non_hallucination_rate=correct / len(data) * 100)
     except Exception as exc:
         # No aggregate score is emitted for incomplete/invalid evaluation.
         metadata.update(status='failed', error_type=type(exc).__name__)
         raise
     finally:
-        meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+        atomic_json(meta_path, metadata)
+
+
+def cli():
+    try:
+        main()
+    except JudgeFailure:
+        traceback.print_exc()
+        return 1
+    except OSError:
+        traceback.print_exc()
+        return os.EX_IOERR
+    except Exception:
+        traceback.print_exc()
+        return os.EX_SOFTWARE
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(cli())

@@ -133,6 +133,97 @@ class Tests(unittest.TestCase):
             self.assertEqual(report['status']['ceval'],'complete')
             self.assertEqual(report['status']['financeiq'],'not_run')
 
+    def test_unwritable_failure_record_stops_run_after_workers_finish(self):
+        from threading import Event, Timer
+        from eval_concurrency import write_records
+        from contextlib import redirect_stderr
+        from io import StringIO
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inputs = root/'inputs'
+            inputs.mkdir()
+            role = dict(model='test', base_url='http://test/v1', api_key_env='TEST_TOKEN')
+            config = dict(datasets=['ceval', 'financeiq'], target=role, judge=role,
+                          continue_on_error=True)
+            file = root/'config.json'
+            file.write_text(json.dumps(config))
+            active, release, finished = Event(), Event(), Event()
+
+            def predict(i):
+                if i == 0:
+                    self.assertTrue(active.wait(3))
+                    raise ValueError('original request error')
+                active.set()
+                release.wait(3)
+                finished.set()
+                return {'id': i}
+
+            def execute(name, tasks, config, folder, mappings):
+                self.assertEqual(name, 'ceval')
+                suite.save(folder/'metrics.partial.json', [['OpenCompass','ceval/A','accuracy',75,'A/metrics.json']])
+                (folder/'samples.failure.json').mkdir()
+                timer = Timer(.15, release.set)
+                timer.start()
+                try:
+                    write_records(folder/'samples.jsonl', predict, [0, 1], 2, 2)
+                finally:
+                    self.assertTrue(finished.is_set(), 'worker escaped stage cleanup')
+                    timer.join()
+
+            stderr = StringIO()
+            output = root/'output'
+            with (patch.object(sys, 'argv', ['suite','--config',str(file),'--output',str(output)]),
+                  patch.dict(suite.os.environ, TEST_TOKEN='dummy'),
+                  patch.object(suite, 'read_mapping', return_value=dict.fromkeys(config['datasets'],str(inputs))),
+                  patch.object(suite, 'setup_snapshot', return_value={}),
+                  patch.object(compass, 'prepare', return_value=[]),
+                  patch.object(compass, 'execute', side_effect=execute),
+                  redirect_stderr(stderr)):
+                self.assertEqual(suite.cli(), 1)
+            summary = json.loads((next(output.iterdir())/'summary.json').read_text())
+            self.assertEqual(summary['overall_status'], 'failed')
+            self.assertEqual(summary['status']['financeiq'], 'not_run')
+            self.assertEqual([(m['dataset'],m['value']) for m in summary['metrics']], [('ceval/A',75)])
+            self.assertIn('original request error', stderr.getvalue())
+            self.assertIn('IsADirectoryError', stderr.getvalue())
+
+    def test_followbench_child_exit_policy(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        for keep_going, failure, expected in (
+            (True, "ValueError('invalid score')", 'complete'),
+            (False, "ValueError('invalid score')", 'not_run'),
+            (True, "OSError(28, 'disk full')", 'not_run'),
+            (True, "RuntimeError('broken scorer')", 'not_run'),
+        ):
+            with self.subTest(keep_going=keep_going, failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                role = dict(model='t',base_url='http://test/v1',api_key_env='TEST_TOKEN')
+                config = dict(datasets=['followbench','ceval'],target=role,judge=role,
+                              continue_on_error=keep_going)
+                (root/'config.json').write_text(json.dumps(config))
+                scorer = root/'eval.py'
+                scorer.write_text('raise '+failure)
+                calls = []
+                def execute(name,tasks,config,folder,mappings):
+                    calls.append(name)
+                    if name == 'followbench':
+                        suite.run([sys.executable,str(suite.SCRIPTS/'followbench_score.py'),str(scorer)],folder)
+                    return []
+                data = root/'inputs'
+                data.mkdir()
+                with (patch.object(sys,'argv',['suite','--config',str(root/'config.json'),'--output',str(root/'out')]),
+                      patch.dict(suite.os.environ, TEST_TOKEN='dummy'),
+                      patch.object(suite,'read_mapping',return_value={'followbench_en':str(data),'ceval':str(data)}),
+                      patch.object(suite,'setup_snapshot',return_value={}),
+                      patch.object(compass,'prepare',return_value=[]),
+                      patch.object(compass,'execute',side_effect=execute), redirect_stderr(StringIO())):
+                    self.assertEqual(suite.cli(),1)
+                summary=json.loads(next((root/'out').glob('*/summary.json')).read_text())
+                self.assertEqual(summary['status']['ceval'],expected)
+                self.assertEqual(calls,['followbench','ceval'] if expected=='complete' else ['followbench'])
+
     def test_preparation_failure_has_a_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); (root/'inputs').mkdir()

@@ -1,4 +1,6 @@
 {
+  "concurrency": 1,
+  "judge_concurrency": 1,
   "dataset_map": "/config/datasets.local.json",
   "target": {
     "base_url": "http://target-server:8000/v1",

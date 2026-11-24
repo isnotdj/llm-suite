@@ -1,18 +1,55 @@
 {
-  "target": {"base_url": "http://target-server:8000/v1", "model": "target-model", "api_key_env": "TARGET_API_KEY", "temperature": 0},
-  "tokenizer": "/nas/modelscope/models/Qwen--Qwen2.5-7B-Instruct/snapshots/master",
-  "context_window": 131072,
-  "max_generation_tokens": 8192,
-  "dataset": {"name": "random"},
+  "vllm_bench_serve": {
+    "model": "target-model",
+    "tokenizer": "/nas/modelscope/models/Qwen--Qwen2.5-7B-Instruct/snapshots/master",
+    "base_url": "http://target-server:8000",
+    "endpoint": "/v1/chat/completions",
+    "backend": "openai-chat",
+    "dataset_name": "random",
+    "seed": 42,
+    "save_detailed": true
+  },
   "profiles": [
-    {"name": "4k", "input_tokens": 4096, "variation": 0.1, "output_target": 1536},
-    {"name": "16k", "input_tokens": 16384, "variation": 0.1, "output_target": 512},
-    {"name": "64k", "input_tokens": 65536, "variation": 0.1, "output_target": 1536}
+    {
+      "name": "4k",
+      "vllm_bench_serve": {
+        "random_input_len": 4096,
+        "random_output_len": 1536
+      }
+    },
+    {
+      "name": "16k",
+      "vllm_bench_serve": {
+        "random_input_len": 16384,
+        "random_output_len": 512
+      }
+    },
+    {
+      "name": "64k",
+      "vllm_bench_serve": {
+        "random_input_len": 65536,
+        "random_output_len": 1536
+      }
+    }
   ],
-  "concurrency": [1, 2, 4, 8, 16, 32, 64, 128],
-  "overload_cap": 256,
-  "slo": {"ttft_ms": 2000, "tpot_ms": 50},
-  "sample_count": 200,
-  "min_samples": 20,
-  "seed": 42
+  "concurrency": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "requests_per_concurrency": 10,
+  "overload_concurrency": [
+    192,
+    256
+  ],
+  "soak_requests": 1000,
+  "slo": {
+    "ttft_ms": 2000,
+    "tpot_ms": 50
+  }
 }

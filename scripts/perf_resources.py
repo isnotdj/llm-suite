@@ -12,6 +12,10 @@ def digest(path):
     return result.hexdigest()
 
 
+def artifact_signature(path):
+    return dict(filename=path.name, size=path.stat().st_size, sha256=digest(path))
+
+
 def configured_tokenizer_files(root):
     """Resolve resource overrides passed to the local Transformers tokenizer."""
     config = root/'tokenizer_config.json'

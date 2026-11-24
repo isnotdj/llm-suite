@@ -33,6 +33,18 @@ class Contracts(unittest.TestCase):
         self.assertEqual(c['profiles'][0]['slo'],{'ttft_ms':2000,'tpot_ms':50})
         c['profiles'][0]['slo']={'ttft_ms':3000}
         self.assertEqual(normalize(c)['profiles'][0]['slo']['tpot_ms'],50)
+    def test_profile_names_are_portable_across_filesystems(self):
+        c = config()
+        profile = c['profiles'][0]
+        c['profiles'] = [dict(profile, name=name) for name in ('4k', '4K')]
+        with self.assertRaisesRegex(ValueError, "'4k' and '4K'"):
+            normalize(c)
+        c['profiles'] = [dict(profile, name='Inputs')]
+        with self.assertRaisesRegex(ValueError, "'Inputs'.*reserved directory inputs"):
+            normalize(c)
+        c['profiles'] = [dict(profile, name='UpperCase')]
+        self.assertEqual(normalize(c)['profiles'][0]['name'], 'UpperCase')
+
     def test_tokenizer_config_is_a_local_directory_path(self):
         cfg=config()
         cfg['tokenizer']='/nas/modelscope/models/Qwen--demo/snapshots/v1'
@@ -41,42 +53,23 @@ class Contracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'directory path'):
             normalize(cfg)
 
-    def test_template_change_after_preparation(self):
+    def test_final_summary_write_failure_exit_codes(self):
+        import signal
+        import contextlib
+        import io
+        from types import SimpleNamespace
         from unittest.mock import patch
-        from run_perf import main
-        tokenizer = Tokenizer()
+        from run_perf import _run
+
+        args = SimpleNamespace(stage='all', validate_only=False)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            template = root/'template.jinja'
-            template.write_text('original')
-            cfg = config()
-            (root/'tokenizer').mkdir()
-            cfg.update(tokenizer=str(root/'tokenizer'), chat_template=str(template))
-            config_path = root/'config.json'
-            config_path.write_text(json.dumps(cfg))
-
-            def prepare_and_replace(config, loaded, output):
-                self.assertIs(loaded, tokenizer)
-                self.assertEqual(loaded.chat_template, 'original')
-                data = prepare(config, loaded, output)
-                template.write_text('replacement')
-                return data
-
-            async def probe(transport, sample):
-                self.assertIs(transport.tokenizer, tokenizer)
-                self.assertEqual(transport.tokenizer.chat_template, 'original')
-                return {'success': True, 'input_token_delta': None}
-
-            with patch('transformers.AutoTokenizer.from_pretrained', return_value=tokenizer) as loader, \
-                    patch('run_perf.prepare', side_effect=prepare_and_replace), \
-                    patch('perf_transport.Transport.__call__', probe), \
-                    patch.dict(os.environ, PERF_TEST_KEY='fixture'):
-                code = main(['--config', str(config_path), '--output', str(root/'out'),
-                             '--stage', 'connectivity'])
-            self.assertEqual(code, 0)
-            loader.assert_called_once()
-            setup = json.loads((next((root/'out').iterdir())/'setup.json').read_text())
-            self.assertEqual(setup['chat_template'], 'original')
+            for result, code in (('complete', 1), (KeyboardInterrupt(), 130)):
+                with self.subTest(result=result), patch('perf_bench_serve.run_native', side_effect=[result]), patch(
+                        'run_perf.atomic_json', side_effect=OSError(28, 'No space left on device')), contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(_run(args, root, signal.default_int_handler, {'vllm_bench_serve': {}}), code)
+                    self.assertIn(str(root/'summary.json'), err.getvalue())
+                    self.assertIn('No space left on device', err.getvalue())
 
     def test_fixed_config_fields_and_seed(self):
         for field, value, message in [
@@ -173,6 +166,14 @@ class Contracts(unittest.TestCase):
         points=[dict(concurrency=n,metrics=m,sufficient=True,client_bottleneck_suspected=True) for n in (1,2)]
         self.assertEqual(select(points,config()['slo']),dict(sweet_concurrency=None,saturation_concurrency=None))
 
+    def test_explicit_overload_levels(self):
+        for levels in ([], [1, 1], [0], [True], [3.5]):
+            with self.subTest(levels=levels), self.assertRaises(ValueError):
+                normalize(dict(config(), overload_concurrency=levels))
+        self.assertEqual(normalize(dict(config(), overload_concurrency=[512]))['overload_concurrency'], [512])
+        with self.assertRaisesRegex(ValueError, 'overload_cap'):
+            normalize(dict(config(), overload_cap=256, overload_concurrency=[512]))
+
     def test_overload_rejections_fail_acceptance(self):
         from perf_metrics import overload_verdict
         r=dict(sample_id='1',success=True,truncated=False,ttft=.1,tpot=.01,
@@ -183,8 +184,8 @@ class Contracts(unittest.TestCase):
         self.assertFalse(verdict['passed']);self.assertTrue(verdict['rejection_observed'])
         result['metrics']=metrics([r],1)
         self.assertTrue(overload_verdict(result)['passed'])
-        result['recovered']=False
-        self.assertFalse(overload_verdict(result)['passed'])
+        del result['recovered']
+        self.assertTrue(overload_verdict(result)['passed'])
 
     def test_stream_timeout_is_guard_failure(self):
         from perf_engine import guard_failure
@@ -276,7 +277,8 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
         self.web=web
         self.mode='normal';self.payload=None
         async def handler(request):
-            self.payload=await request.json()
+            request_body = await request.json()
+            self.payload = request_body
             if self.mode=='secret_error': return web.Response(status=503,reason='test-secret')
             if self.mode=='error': return web.Response(status=503)
             if self.mode=='timeout':
@@ -306,7 +308,7 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
             if self.mode!='incomplete':
                 if self.mode!='done_without_finish':
                     await event({'choices':[{'delta':{},'finish_reason':'length' if self.mode=='length' else 'stop'}]})
-                if self.mode not in ('no_usage','reasoning_no_usage'): await event({'choices':[],'usage':getattr(self,'usage_override',{'prompt_tokens':len(''.join(m['content'] for m in self.payload['messages']))+3,'completion_tokens':9})})
+                if self.mode not in ('no_usage','reasoning_no_usage'): await event({'choices':[],'usage':getattr(self,'usage_override',{'prompt_tokens':len(''.join(m['content'] for m in request_body['messages']))+3,'completion_tokens':9})})
                 await response.write(b'data: [DONE]\n\n')
                 if hasattr(self,'done_gate'):
                     await self.done_gate.wait()
@@ -473,7 +475,7 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
     async def test_truncated_and_incomplete(self):
         for mode in ('length','incomplete','error'):
             self.mode=mode;row=await self.request()
-            self.assertFalse(row['success'])
+            self.assertEqual(row['success'], mode == 'length')
             self.assertEqual(row['truncated'],mode=='length')
     async def test_timeout(self):
         self.mode='timeout';row=await self.request(.01)
@@ -568,11 +570,196 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r['metrics']['requests'],count)
             self.assertGreater(r['drain_seconds'],0)
             self.assertGreater(len(r['windows']),1)
+    async def test_burst_windows_continue_while_requests_drain(self):
+        from perf_engine import load
+        c = config()
+        c['timing']['window'] = .04
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            window_log = root/'burst.windows.jsonl'
+
+            async def transport(sample):
+                start = time.perf_counter()
+                if sample == 'early':
+                    await asyncio.sleep(.05)
+                else:
+                    # The first completion must reach disk before the last response arrives.
+                    async with asyncio.timeout(2):
+                        while not any(json.loads(line)['metrics']['requests'] for line in window_log.read_text().splitlines()):
+                            await asyncio.sleep(.01)
+                end = time.perf_counter()
+                return dict(sample_id=sample, start=start, end=end, success=True, truncated=False,
+                            ttft=.01, tpot=.01, latency=end-start, input_tokens=10, output_tokens=4, http_status=200)
+
+            result = await load(transport, ['early', 'late'], 2, 0, 0, 2, c, root,
+                                'burst', c['slo'], request_limit=2)
+            windows = [json.loads(line) for line in window_log.read_text().splitlines()]
+            self.assertEqual(windows, result['windows'])
+            self.assertEqual([w['metrics']['requests'] for w in windows if w['metrics']['requests']], [1, 1])
+            self.assertEqual(result['metrics']['requests'], 2)
+            self.assertAlmostEqual(windows[-1]['end'], result['duration'])
+
+    async def test_linearity_exact_counts_and_reports(self):
+        from legacy_perf import execute
+        c = config()
+        self.assertEqual(c['requests_per_concurrency'], 10)
+        c.update(concurrency=[1, 4], requests_per_concurrency=3)
+        c['target']['base_url'] = f'http://127.0.0.1:{self.port}/v1'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokenizer = Tokenizer()
+            prepared, _ = prepare(c, tokenizer, root)
+            summary = {'profiles': {}}
+            await execute(c, tokenizer, prepared, root, summary, 'scan')
+            points = summary['profiles']['tiny']['scan']
+            self.assertEqual([p['request_limit'] for p in points], [3, 12])
+            for point in points:
+                count = point['request_limit']
+                self.assertEqual(point['metrics']['requests'], count)
+                self.assertTrue(point['sufficient'])
+                rows = (root/'tiny'/point['requests_file']).read_text().splitlines()
+                self.assertEqual(sorted(json.loads(row)['sequence'] for row in rows), list(range(count)))
+                native = root/'tiny'/f"scan-c{point['concurrency']}.vllm.json"
+                report = json.loads(native.read_text())
+                self.assertEqual(report['completed'], count)
+                self.assertEqual(report['vllm_suite_metadata']['scheduler'], 'fixed-request-count')
+            self.assertFalse(list((root/'tiny').glob('warmup*')))
+
+    async def test_burst_three_independent_rounds_per_concurrency(self):
+        from legacy_perf import execute
+        c = config()
+        c['overload_concurrency'] = [1, 4]
+        c['concurrency'] = [2, 8]
+        c['target']['base_url'] = f'http://127.0.0.1:{self.port}/v1'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokenizer = Tokenizer()
+            prepared, _ = prepare(c, tokenizer, root)
+            summary = {'profiles': {}}
+            await execute(c, tokenizer, prepared, root, summary, 'overload')
+            state = summary['profiles']['tiny']
+            self.assertNotIn('scan', state)
+            points = state['overload']
+            self.assertEqual([p['request_limit'] for p in points], [1, 1, 1, 4, 4, 4])
+            previous_end = 0
+            for i, point in enumerate(points):
+                size = point['concurrency']
+                label = f'overload-c{size}-r{i % 3 + 1}'
+                self.assertEqual(point['requests_file'], label+'.requests.jsonl')
+                report = json.loads((root/'tiny'/(label+'.vllm.json')).read_text())
+                self.assertEqual(report['vllm_suite_metadata']['scheduler'], 'single-pulse')
+                rows = [json.loads(line) for line in (root/'tiny'/point['requests_file']).read_text().splitlines()]
+                self.assertEqual(len(rows), size)
+                self.assertGreaterEqual(min(r['start'] for r in rows), previous_end)
+                self.assertLess(max(r['start'] for r in rows), min(r['end'] for r in rows))
+                previous_end = max(r['end'] for r in rows)
+                self.assertIn(label, (root/'vllm-report.txt').read_text())
+
+    async def test_round_barrier_before_next_dispatch(self):
+        from unittest.mock import patch
+        from legacy_perf import execute_stages
+        c = config()
+        c['overload_concurrency'] = [2]
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = 0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokenizer = Tokenizer()
+            prepared, _ = prepare(c, tokenizer, root)
+            folder = root/'tiny'
+            async def request(sample):
+                nonlocal calls
+                calls += 1
+                ordinal = calls
+                # Four connectivity probes, then two requests per round.
+                if ordinal == 6:
+                    started.set()
+                    await release.wait()
+                if ordinal == 7:
+                    self.assertTrue((folder/'overload-c2-r1.json').is_file())
+                    self.assertIn('overload-c2-r1', (root/'report-jobs.json').read_text())
+                return dict(sample_id=sample['id'], start=0, end=1, success=ordinal != 5,
+                            truncated=False, http_status=503 if ordinal == 5 else 200,
+                            ttft=.1, tpot=.01, latency=1, input_tokens=10, output_tokens=4)
+            summary = {'profiles': {}}
+            with patch('perf_transport.Transport', return_value=request):
+                task = asyncio.create_task(execute_stages(c, tokenizer, prepared, root, summary, 'overload', []))
+                try:
+                    await asyncio.wait_for(started.wait(), timeout=3)
+                    await asyncio.sleep(.05)
+                    self.assertEqual(calls, 6)
+                    self.assertFalse((folder/'overload-c2-r1.json').exists())
+                finally:
+                    release.set()
+                    await task
+            self.assertEqual(calls, 10)
+            self.assertEqual(summary['profiles']['tiny']['overload_status'], 'failed_acceptance')
+
+    async def test_failed_publication_stops_dispatch(self):
+        from unittest.mock import patch
+        from itertools import product
+        from legacy_perf import execute, atomic_json, save_jobs
+        c = config()
+        c['overload_concurrency'] = [1]
+        for failure, exception in product(('result', 'manifest', 'summary'), (OSError, KeyboardInterrupt)):
+            with self.subTest(failure=failure, exception=exception), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tokenizer = Tokenizer()
+                prepared, _ = prepare(c, tokenizer, root)
+                summary = {'profiles': {}, 'errors': []}
+                calls = 0
+                async def request(sample):
+                    nonlocal calls
+                    calls += 1
+                    return dict(sample_id=sample['id'], start=0, end=1, success=True, truncated=False,
+                                http_status=200, ttft=.1, tpot=.01, latency=1, input_tokens=10, output_tokens=4)
+                def write(path, value):
+                    if failure == 'result' and path.name == 'overload-c1-r1.json':
+                        raise exception(failure)
+                    if failure == 'summary' and path.name == 'summary.json' and calls == 5 and 'overall_status' not in value:
+                        raise exception(failure)
+                    atomic_json(path, value)
+                def manifest(*args, **kwargs):
+                    if failure == 'manifest' and not kwargs.get('discover'):
+                        raise exception(failure)
+                    return save_jobs(*args, **kwargs)
+                with patch('perf_transport.Transport', return_value=request), patch('legacy_perf.atomic_json', write), patch('legacy_perf.save_jobs', manifest):
+                    with self.assertRaisesRegex(exception, failure):
+                        await execute(c, tokenizer, prepared, root, summary, 'overload')
+                status = 'interrupted' if exception is KeyboardInterrupt else 'failed'
+                saved = json.loads((root/'summary.json').read_text())
+                self.assertEqual(saved['overall_status'], status)
+                self.assertEqual(saved['profiles']['tiny']['overload_status'], status)
+                self.assertEqual(saved['profiles']['tiny'][status+'_phase'], 'overload-c1-r1')
+                self.assertEqual(calls, 5)
+                self.assertFalse((root/'tiny/overload-c1-r2.requests.jsonl').exists())
+
+    async def test_deadline_stops_refills_but_drains_inflight(self):
+        from perf_engine import load
+        c = config()
+        c['timing']['window'] = 60
+        with tempfile.TemporaryDirectory() as directory:
+            starts = []
+            async def request(sample):
+                start = time.perf_counter()
+                starts.append(start)
+                await asyncio.sleep(.1 if len(starts) == 1 else .005)
+                end = time.perf_counter()
+                return dict(sample_id='x', start=start, end=end, success=True, truncated=False,
+                            ttft=.001, tpot=.001, latency=end-start, input_tokens=10, output_tokens=4)
+            result = await load(request, [{}], 2, .05, .05, 0, c, Path(directory), 'soak', c['slo'])
+            self.assertAlmostEqual(result['dispatch_seconds'], .05, places=6)
+            self.assertTrue(all(t - starts[0] < .05 for t in starts))
+            self.assertGreaterEqual(result['duration'], .1)
+            self.assertTrue(result['sufficient'])
+            self.assertEqual(result['metrics']['completed'], len(starts))
+
     async def test_full_orchestration(self):
         from unittest.mock import patch
-        from run_perf import execute
+        from legacy_perf import execute
         c=config();c['target']['base_url']=f'http://127.0.0.1:{self.port}/v1'
         c['concurrency']=[1,2]
+        c['overload_concurrency']=[3]
         c['timing'].update(warmup=.05,scan=.08,scan_max=.3,scan_requests=2,
             overload=.05,recovery=.5,recovery_window=.05,soak=.08,window=.05)
         with tempfile.TemporaryDirectory() as directory:
@@ -586,7 +773,9 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
             with patch('perf_native_report.write_report',side_effect=after_traffic):
                 await execute(c,tokenizer,data,root,summary,'all')
             state=summary['profiles']['tiny']
-            self.assertEqual(len(state['scan']),2)
+            self.assertEqual([r['metrics']['requests'] for r in state['scan']], [10, 20])
+            self.assertEqual([r['metrics']['requests'] for r in state['overload']], [3, 3, 3])
+            self.assertEqual(state['overload_status'], 'complete', [r['acceptance'] for r in state['overload']])
             self.assertIsNotNone(state['sweet_concurrency'])
             self.assertIn('soak',state)
             self.assertEqual(json.loads((root/'summary.json').read_text()), summary)
@@ -595,65 +784,13 @@ class Streaming(unittest.IsolatedAsyncioTestCase):
             reports=json.loads((root/'vllm-reports.json').read_text())
             self.assertTrue(any(r['phase']=='soak' for r in reports))
             report=json.loads((root/'tiny/soak.vllm.json').read_text())
+            self.assertEqual(report['vllm_suite_metadata']['scheduler'], 'vllm-suite duration-based closed loop')
             self.assertIn('mean_ttft_ms',report)
             self.assertIn('generated_texts',report)
             rows=[json.loads(line) for line in (root/'tiny/soak.requests.jsonl').read_text().splitlines()]
             rows.sort(key=lambda r:r['sequence'])
             self.assertEqual(len(report['ttfts']),len(rows))
             self.assertEqual(report['generated_texts'],[r['native_output']['generated_text'] for r in rows])
-
-    async def test_overload_recovery_sequence(self):
-        from unittest.mock import patch
-        from run_perf import execute
-        c=config();c['target']['base_url']=f'http://127.0.0.1:{self.port}/v1'
-        c['concurrency']=[1,2];c['timing'].update(recovery=3,recovery_window=1)
-        calls=[]
-        async def controlled_load(transport,samples,concurrency,duration,maximum,minimum,config,folder,label,slo,guard=False):
-            folder.mkdir(parents=True,exist_ok=True);calls.append((label,concurrency))
-            row=dict(sample_id='1',success=True,truncated=False,ttft=.1,tpot=.01,latency=.2,
-                input_tokens=100,output_tokens=10,http_status=200)
-            m=metrics([row],1)
-            return dict(concurrency=concurrency,metrics=m,sufficient=True,aborted=None,
-                windows=[],dispatch_seconds=duration,slo_pass=True,client_bottleneck_suspected=False)
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);tokenizer=Tokenizer();data,_=prepare(c,tokenizer,root)
-            summary={'profiles':{}}
-            with patch('perf_engine.load',side_effect=controlled_load):
-                await execute(c,tokenizer,data,root,summary,'all')
-            state=summary['profiles']['tiny']
-            self.assertEqual(state['saturation_concurrency'],1)
-            self.assertEqual([r['concurrency'] for r in state['overload']],[2,3])
-            self.assertTrue(all(r['recovered'] for r in state['overload']))
-            saved=json.loads((root/'tiny/overload-c2.json').read_text())
-            self.assertTrue(saved['acceptance']['passed'])
-            self.assertEqual(sum('recovery' in label for label,c in calls),6)
-            self.assertEqual(state['soak_status'],'complete')
-
-    async def test_recovery_total_deadline(self):
-        from unittest.mock import patch
-        from run_perf import execute
-        c=config();c['target']['base_url']=f'http://127.0.0.1:{self.port}/v1'
-        c['concurrency']=[1,2];c['timing'].update(recovery=.05,recovery_window=.01)
-        cancelled=[]
-        async def slow_recovery(t,s,n,d,maximum,minimum,config,folder,label,slo,guard=False):
-            folder.mkdir(parents=True,exist_ok=True)
-            if 'recovery' in label:
-                try: await asyncio.sleep(10)
-                finally: cancelled.append(label)
-            row=dict(sample_id='1',success=True,truncated=False,ttft=.1,tpot=.01,latency=.2,
-                input_tokens=100,output_tokens=10,http_status=200)
-            return dict(concurrency=n,metrics=metrics([row],1),sufficient=True,aborted=None,
-                windows=[],dispatch_seconds=d,slo_pass=True,client_bottleneck_suspected=False)
-        with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);tokenizer=Tokenizer();data,_=prepare(c,tokenizer,root);summary={'profiles':{}}
-            started=time.perf_counter()
-            with patch('perf_engine.load',side_effect=slow_recovery):
-                with self.assertRaisesRegex(ValueError,'did not recover'):
-                    await execute(c,tokenizer,data,root,summary,'overload')
-            self.assertLess(time.perf_counter()-started,1)
-            self.assertEqual(len(cancelled),1)
-            self.assertEqual(summary['profiles']['tiny']['overload_status'],'failed_acceptance')
-            self.assertFalse(summary['profiles']['tiny']['overload'][0]['acceptance']['passed'])
 
     async def test_cancellation_preserves_logs(self):
         from perf_engine import load

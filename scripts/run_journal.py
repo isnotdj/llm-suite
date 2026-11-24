@@ -77,12 +77,13 @@ class RunJournal:
             atomic_json(self.root/'setup.json', setup)
         self.flush()
 
-    def error(self, exc, detail):
+    def error(self, exc, detail, *, flush=True):
         if self.last_error is exc: return
         self.last_error = exc
         self.data['errors'].append(dict(phase=self.data['phase'],
             dataset=self.data['active_dataset'], type=type(exc).__name__, detail=detail))
-        self.flush()
+        if flush:
+            self.flush()
 
     def ready(self, setup, validate_only=False):
         self.data['setup'] = setup
@@ -99,12 +100,15 @@ class RunJournal:
         self.data['status'][name] = 'running'
         self.flush()
 
-    def record(self, name, rows, error=None):
+    def merge_metrics(self, name, rows):
         # Replace this dataset's committed results, so retries/interruption cannot duplicate rows.
         normalized = [r if isinstance(r,dict) else dict(zip(
             ('framework','dataset','metric','value','source'),r)) for r in rows]
         self.data['metrics'] = [r for r in self.data['metrics'] if r.get('run_dataset') != name]
         self.data['metrics'].extend(dict(r,run_dataset=name) for r in normalized)
+
+    def record(self, name, rows, error=None):
+        self.merge_metrics(name, rows)
         self.data['status'][name] = 'failed: '+type(error).__name__ if error else 'complete'
         self.data['active_dataset'] = None
         self.flush()

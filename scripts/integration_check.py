@@ -79,7 +79,33 @@ def fixtures(root):
     return paths
 
 
+class RequestProbe:
+    def __init__(self, expected):
+        self.expected = expected
+        self.arrivals = 0
+        self.release = threading.Event()
+        self.condition = threading.Condition()
+
+    def before_response(self):
+        with self.condition:
+            if self.release.is_set():
+                return
+            self.arrivals += 1
+            self.condition.notify_all()
+        if not self.release.wait(90):
+            raise AssertionError('Timed out waiting for the test to release the response')
+
+    def verify_limit(self):
+        # All counted requests are still waiting for their first response byte.
+        with self.condition:
+            assert self.condition.wait_for(lambda: self.arrivals >= self.expected, timeout=60), self.arrivals
+            exceeded = self.condition.wait_for(lambda: self.arrivals > self.expected, timeout=0.5)
+            self.release.set()
+            assert not exceeded, (self.expected, self.arrivals)
+
+
 class API(BaseHTTPRequestHandler):
+    probes = {}
     calls=0
     truncate=False
     invalid_judge=False
@@ -91,6 +117,14 @@ class API(BaseHTTPRequestHandler):
         API.calls+=1
         if API.on_first is not None:
             callback=API.on_first;API.on_first=None;callback()
+        probe = API.probes.get(request['model'])
+        if probe is not None:
+            probe.before_response()
+        payload = self.response_payload(request)
+        body=json.dumps(payload).encode();self.send_response(200);self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+
+    def response_payload(self, request):
         prompt='\n'.join(m['content'] for m in request['messages'])
         if request.get('n')==5: answer='否'
         elif 'Rating: [[rating]]' in prompt: answer='Example: [[10]]\nRating: [[0]]' if API.invalid_judge else 'Rating: [[1]]'
@@ -99,11 +133,9 @@ class API(BaseHTTPRequestHandler):
         elif 'Python列表' in prompt:
             level=int(re.findall(r'包含(\d+)个元素',prompt)[-1]);answer=repr(['YES']*level)
         else: answer='A'
-        payload=dict(id='offline-test',object='chat.completion',created=0,model='test',
+        return dict(id='offline-test',object='chat.completion',created=0,model='test',
             choices=[dict(index=i,message=dict(role='assistant',content=answer),finish_reason='length' if API.truncate else 'stop')
                      for i in range(request.get('n',1))],usage=dict(prompt_tokens=1,completion_tokens=1,total_tokens=2))
-        body=json.dumps(payload).encode();self.send_response(200);self.send_header('Content-Type','application/json')
-        self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 
 
 def main():
@@ -113,7 +145,7 @@ def main():
     server=ThreadingHTTPServer(('127.0.0.1',0),API)
     threading.Thread(target=server.serve_forever,daemon=True).start()
     role=dict(base_url=f'http://127.0.0.1:{server.server_port}/v1',model='test',api_key_env='TEST_API_KEY')
-    config=dict(datasets=list(SUPPORTED),dataset_map=str(mapping),target=role,judge=role,
+    config=dict(concurrency=3,judge_concurrency=2,datasets=list(SUPPORTED),dataset_map=str(mapping),target=role,judge=role,
         options={name:dict(limit=1) for name in SUPPORTED if name not in ('halluqa','followbench')},
         continue_on_error=True)
     file=root/'config.json';file.write_text(json.dumps(config))
@@ -142,20 +174,46 @@ def main():
         cmrc={m['metric']:m['value'] for m in report['metrics'] if m['dataset'].startswith('cmrc2018/')}
         assert cmrc=={'EM':100.0,'F1':100.0}, cmrc
         assert all(m['value']==100 for m in report['metrics'] if m['dataset'].startswith('ceval/') and m['metric']=='accuracy')
+        comparisons = []
+        for concurrency in (1, 4):
+            subset_config = dict(config, datasets=['ceval'], concurrency=concurrency,
+                                 options={'ceval': {'subsets': ['ceval-computer_network'], 'limit': 5}})
+            file.write_text(json.dumps(subset_config))
+            output = root / f'ceval-c{concurrency}'
+            subprocess.run(cmd + ['--output', str(output)], check=True, env=env)
+            run_dir = next(output.iterdir())
+            samples, = (run_dir / 'ceval').rglob('samples.jsonl')
+            metrics = json.loads((run_dir / 'summary.json').read_text())['metrics']
+            comparisons.append((samples.read_bytes(), [(m['dataset'], m['metric'], m['value']) for m in metrics]))
+        assert comparisons[0] == comparisons[1]
         config['datasets']=['followbench'];config['options']={}
         config['followbench']={'language':'zh'}
-        file.write_text(json.dumps(config))
-        subprocess.run(cmd+['--output',str(root/'followbench-zh')],check=True,env=env)
+        measured = dict(config, concurrency=4, judge_concurrency=2,
+                        target=dict(role, model='probe-target'), judge=dict(role, model='probe-judge'))
+        API.probes = {'probe-target': RequestProbe(4), 'probe-judge': RequestProbe(2)}
+        file.write_text(json.dumps(measured))
+        with subprocess.Popen(cmd+['--output',str(root/'followbench-zh')], env=env) as process:
+            try:
+                API.probes['probe-target'].verify_limit()
+                API.probes['probe-judge'].verify_limit()
+            finally:
+                for probe in API.probes.values():
+                    probe.release.set()
+            assert process.wait() == 0
         zh_report=json.loads((next((root/'followbench-zh').iterdir())/'summary.json').read_text())
         assert zh_report['overall_status']=='complete'
+        peaks = {model: probe.arrivals for model, probe in API.probes.items()}
+        assert peaks == {'probe-target': 4, 'probe-judge': 2}, peaks
         API.truncate=True
         config['datasets']=['ceval']
         config['options']={'ceval':{'subsets':['ceval-computer_network'],'limit':1}}
         file.write_text(json.dumps(config))
-        rejected=subprocess.run(cmd+['--output',str(root/'truncated')],env=env)
-        assert rejected.returncode==1
-        failed=json.loads((next((root/'truncated').iterdir())/'summary.json').read_text())
-        assert failed['overall_status']=='failed' and not failed['metrics']
+        subprocess.run(cmd+['--output',str(root/'length')],check=True,env=env)
+        run_dir = next((root/'length').iterdir())
+        report_length = json.loads((run_dir/'summary.json').read_text())
+        assert report_length['overall_status'] == 'complete' and report_length['metrics']
+        samples, = (run_dir/'ceval').rglob('samples.jsonl')
+        assert json.loads(samples.read_text())['finish_reason'] == 'length'
         API.truncate=False; API.invalid_judge=True
         config['datasets']=['finsafetybench'];config['options']={}
         file.write_text(json.dumps(config))
@@ -178,7 +236,7 @@ def main():
         assert failed['overall_status']=='failed' and not failed['metrics']
         assert failed['setup']['target']['model']=='test' and not failed['setup']['snapshot_complete']
         assert failed['errors'][0]['phase']=='preparation' and failed['errors'][0]['dataset']=='halluqa'
-        print(json.dumps(dict(status='passed',datasets=list(SUPPORTED),api_calls=API.calls,
+        print(json.dumps(dict(status='passed',datasets=list(SUPPORTED),api_calls=API.calls,peak_requests=peaks,
             metrics=len(report['metrics']),frozen_nas_inputs=True,invalid_reference_rejected_before_api=True,final_rating_validated=True,artifacts=str(root)),ensure_ascii=False))
     finally:server.shutdown()
 

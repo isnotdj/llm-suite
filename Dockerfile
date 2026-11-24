@@ -1,13 +1,17 @@
 FROM vllm/vllm-openai:v0.11.0 AS native-bench
 RUN python3 -m pip install --no-cache-dir 'vllm[bench]==0.11.0'
 COPY scripts/ /opt/evaluation/scripts/
-COPY perf.native.example.json /opt/evaluation/
+COPY perf.example.json perf.native.example.json /opt/evaluation/
 RUN HF_HUB_OFFLINE=1 python3 /opt/evaluation/scripts/run_perf.py \
     --config /opt/evaluation/perf.native.example.json --output /tmp/native-parser-check --validate-only
-ENTRYPOINT ["python3", "/opt/evaluation/scripts/run_perf.py"]
+RUN HF_HUB_OFFLINE=1 python3 /opt/evaluation/scripts/run_perf.py \
+    --config /opt/evaluation/perf.example.json --output /tmp/stage-parser-check --validate-only \
+    && printf '#!/bin/sh\nexec python3 /opt/evaluation/scripts/run_perf.py "$@"\n' > /usr/local/bin/perf-suite \
+    && chmod +x /usr/local/bin/perf-suite
+ENTRYPOINT ["perf-suite"]
 CMD ["--help"]
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS accuracy
 
 LABEL org.opencontainers.image.title="vllm-suite" \
       org.opencontainers.image.description="Remote LLM accuracy evaluation and performance testing"
@@ -61,8 +65,7 @@ RUN python -c "import tiktoken; [tiktoken.get_encoding(n) for n in ('gpt2','r50k
 WORKDIR /opt/evaluation
 COPY datasets.json /opt/evaluation/datasets.json
 COPY scripts/ /opt/evaluation/scripts/
-COPY dataset-map.example.json suite.example.json README.md /opt/evaluation/
-COPY docs/ /opt/evaluation/docs/
+COPY dataset-map.example.json suite.example.json /opt/evaluation/
 RUN chmod +x scripts/dataset_path.py scripts/run_suite.py \
     && ln -s /opt/evaluation/scripts/dataset_path.py /usr/local/bin/dataset-path \
     && ln -s /opt/evaluation/scripts/run_suite.py /usr/local/bin/eval-suite
@@ -92,7 +95,7 @@ WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]
 
-# Independent CPU-only benchmark client; no vLLM serving engine/CUDA install.
+# CPU-only dependencies for rebuilding historical performance reports.
 COPY requirements.perf.lock perf.example.json /opt/evaluation/
 RUN python3.12 -m venv /opt/perf-venv \
     && /opt/perf-venv/bin/pip install --no-cache-dir -r /opt/evaluation/requirements.perf.lock \
@@ -101,3 +104,30 @@ RUN python3.12 -m venv /opt/perf-venv \
     && ln -s /opt/evaluation/scripts/run_perf.py /usr/local/bin/perf-suite \
     && /opt/perf-venv/bin/python -c "import sys; sys.path.insert(0,'/opt/evaluation/scripts'); from perf_native_report import upstream_report; upstream_report()" \
     && perf-suite --help >/dev/null
+
+# Interactive image for running both clients against remote APIs.
+FROM accuracy AS suite-runtime
+COPY perf.native.example.json /opt/evaluation/
+RUN /usr/bin/python3.12 -m venv /opt/native-bench \
+    && /opt/native-bench/bin/python -m pip install --no-cache-dir --index-url "${TORCH_INDEX_URL}" 'torch==2.8.0+cpu' 'torchvision==0.23.0+cpu' 'torchaudio==2.8.0+cpu' \
+    && /opt/native-bench/bin/python -m pip install --no-cache-dir 'setuptools>=77.0.3,<80' 'setuptools-scm>=8' wheel 'packaging>=24.2'
+# The upstream device-free build includes the official remote benchmark client.
+ARG VLLM_SDIST=https://files.pythonhosted.org/packages/82/5a/36d2351206f4d8d871b10780f874d03957985e08298d430cc837723e07af/vllm-0.11.0.tar.gz#sha256=f435a64c24e9c4178d657a76f8edd8548ddc444012f7d06a9f79ac3a6392bfae
+RUN VLLM_TARGET_DEVICE=empty /opt/native-bench/bin/python -m pip install --no-cache-dir --no-build-isolation "vllm[bench] @ ${VLLM_SDIST}" 'transformers==4.57.1' 'ijson==3.4.0' \
+    && /opt/native-bench/bin/python -m pip check \
+    && mkdir -p /opt/live-bin \
+    && printf '#!/bin/sh\nexec /opt/native-bench/bin/python /opt/evaluation/scripts/run_perf.py "$@"\n' > /opt/live-bin/perf-suite \
+    && chmod +x /opt/live-bin/perf-suite
+ENV PATH=/opt/live-bin:$PATH
+RUN HF_HUB_OFFLINE=1 perf-suite --config /opt/evaluation/perf.example.json --output /tmp/combined-parser-check --validate-only \
+    && eval-suite --help >/dev/null
+
+FROM suite-runtime AS suite
+COPY --chmod=755 scripts/perf-then-eval /usr/local/bin/perf-then-eval
+RUN perf-then-eval --help
+COPY README.md /opt/evaluation/
+COPY docs/ /opt/evaluation/docs/
+COPY dataset-map.default.json /opt/evaluation/
+RUN chmod 755 /opt/evaluation/scripts/run_unified.py \
+    && ln -s /opt/evaluation/scripts/run_unified.py /usr/local/bin/vllm-suite \
+    && vllm-suite --help >/dev/null

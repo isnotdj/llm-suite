@@ -3,6 +3,8 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import Mock, patch
+import os
 
 spec = importlib.util.spec_from_file_location('halluqa', Path(__file__).parents[1] / 'scripts/halluqa_eval.py')
 module = importlib.util.module_from_spec(spec)
@@ -18,7 +20,7 @@ class TransportError(Exception):
 class Tests(unittest.TestCase):
     def setUp(self):
         self.original = sys.modules.get('openai')
-        sys.modules['openai'] = types.SimpleNamespace(APIStatusError=StatusError,
+        sys.modules['openai'] = types.SimpleNamespace(APIError=(StatusError, TransportError), APIStatusError=StatusError,
             APIConnectionError=TransportError, APITimeoutError=TransportError)
 
     def tearDown(self):
@@ -50,6 +52,19 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(waits), 2)
         self.assertTrue(all(t <= 8 for t in waits))
 
+    def test_judge_exit_policy(self):
+        def denied(**kwargs):
+            raise StatusError(401)
+        failures = [(lambda: module.judge(self.client(denied), {}), 1)]
+        for exc, code in [(module.JudgeFailure('invalid votes'), 1),
+                          (OSError('disk full'), os.EX_IOERR),
+                          (RuntimeError('broken scorer'), os.EX_SOFTWARE),
+                          (ValueError('broken scorer'), os.EX_SOFTWARE)]:
+            failures.append((exc, code))
+        for failure, expected in failures:
+            with self.subTest(failure=failure), patch.object(module, 'main', side_effect=failure), patch.object(module.traceback, 'print_exc'):
+                self.assertEqual(module.cli(), expected)
+
     def test_short_vote_batch_is_rejected(self):
         calls = []
         def create(**kw):
@@ -60,12 +75,24 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(calls), 5)
         self.assertTrue(all(x['n'] == 5 for x in calls))
 
-    def test_truncated_votes_are_rejected(self):
+    def test_malformed_batches_retry_then_recover_or_fail_the_dataset(self):
+        choice = types.SimpleNamespace(message=types.SimpleNamespace(content='否'), finish_reason='stop')
+        valid = types.SimpleNamespace(choices=[choice] * 5)
+        for choices in (None, {}, [None] * 5, [types.SimpleNamespace(message=None)] * 5):
+            malformed = types.SimpleNamespace(choices=choices)
+            with self.subTest(choices=choices):
+                create = Mock(side_effect=[malformed, valid])
+                self.assertEqual(module.judge(self.client(create), {}), ['否'] * 5)
+                create = Mock(return_value=malformed)
+                with self.assertRaises(module.JudgeFailure):
+                    module.judge(self.client(create), {})
+                self.assertEqual(create.call_count, 5)
+
+    def test_length_terminated_votes_are_scored(self):
         def create(**kw):
             return types.SimpleNamespace(choices=[types.SimpleNamespace(
                 message=types.SimpleNamespace(content='是'), finish_reason='length') for _ in range(5)])
-        with self.assertRaises(ValueError):
-            module.judge(self.client(create), {})
+        self.assertEqual(module.judge(self.client(create), {}), ['是'] * 5)
 
     def test_official_votes_preserved(self):
         votes = ['是', '是', '是', '否', '否']

@@ -2,6 +2,7 @@
 
 No model/tokenizer is loaded. Full prompts are sent without silent truncation.
 """
+from eval_concurrency import records, write_records
 import copy
 import importlib.util
 import json
@@ -148,27 +149,27 @@ def prepare(name, path, options):
 
 
 def execute(name, tasks, config, folder, mappings):
-    from run_suite import client, generate_messages, save
+    from run_suite import client, generate_choice, save
     from opencompass.registry import TEXT_POSTPROCESSORS
     from compass_plugins import OfficialEvaluator, strict_option
     from run_inputs import iter_inputs, check_inputs
     from evaluation_contracts import validate_metrics
     api = client(config['target'])
+    def predict(item):
+        choice = generate_choice(api, config['target'], item['messages'])
+        return dict(id=item['sample_id'], messages=item['messages'], reference=item['reference'],
+                    prediction=choice.message.content, finish_reason=choice.finish_reason)
+
     rows = []
     for task in tasks:
         spec = task['config']; abbr = spec['abbr']
         work = folder / abbr; work.mkdir()
         raw = work / 'samples.jsonl'
         predictions, references = [], []
-        with raw.open('w') as out:
-            for item in iter_inputs(task):
-                idx, prompt, reference = item['sample_id'], item['messages'], item['reference']
-                references.append(reference)
-                prediction = generate_messages(api, config['target'], prompt)
-                predictions.append(prediction)
-                out.write(json.dumps(dict(id=idx, messages=prompt, reference=reference,
-                                          prediction=prediction), ensure_ascii=False)+'\n')
-                out.flush()
+        write_records(raw, predict, iter_inputs(task), config.get('concurrency', 1), task['count'])
+        for record in records(raw):
+            predictions.append(record['prediction'])
+            references.append(record['reference'])
         evaluator_cfg = spec['eval_cfg']
         pp = evaluator_cfg.get('pred_postprocessor')
         if pp:

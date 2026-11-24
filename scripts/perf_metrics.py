@@ -1,9 +1,9 @@
 """Explicit metrics and selection rules; seconds internally."""
 import math
 
-HEALTH_POLICY = dict(version=1,min_success_rate=.999,recovery_success_rate=1.,
+HEALTH_POLICY = dict(version=3,min_success_rate=.999,
                      saturation_tail_points=2,saturation_growth=.05,near_peak_ratio=.95,
-                     recovery_latency_ratio=1.2,error_window_seconds=60,error_rate=.2)
+                     error_window_seconds=60,error_rate=.2)
 
 
 def percentile(values, p):
@@ -41,17 +41,15 @@ def qualifies(m, slo):
     return stage_verdict(dict(metrics=m,sufficient=True),slo)['passed']
 
 
-def stage_verdict(point, slo=None, perfect=False):
-    """One health contract for scan, selection, recovery and acceptance."""
+def stage_verdict(point, slo=None):
+    """One health contract for scan, selection and acceptance."""
     m = point['metrics']
     reasons = []
     if not point['sufficient']: reasons.append('insufficient_load')
     if point.get('aborted'): reasons.append('guard_triggered')
     if point.get('client_bottleneck_suspected'): reasons.append('client_bottleneck')
     if not m['requests']: reasons.append('no_requests')
-    threshold = HEALTH_POLICY['recovery_success_rate' if perfect else 'min_success_rate']
-    if m['success_rate'] < threshold: reasons.append('success_rate')
-    if m['truncated']: reasons.append('truncated')
+    if m['success_rate'] < HEALTH_POLICY['min_success_rate']: reasons.append('success_rate')
     if m.get('input_token_mismatches',0): reasons.append('input_token_mismatch')
     if slo is not None:
         for key in ('ttft','tpot'):
@@ -61,13 +59,29 @@ def stage_verdict(point, slo=None, perfect=False):
     return dict(passed=not reasons, reasons=reasons)
 
 
-def recovery_passes(point, baseline):
-    return (stage_verdict(point, perfect=True)['passed']
-        and stage_verdict(baseline, perfect=True)['passed']
-        and all(point['metrics'][k]['p95'] is not None
-                and baseline['metrics'][k]['p95'] is not None
-                and point['metrics'][k]['p95'] <= baseline['metrics'][k]['p95']*HEALTH_POLICY['recovery_latency_ratio']
-                for k in ('ttft','tpot')))
+def soak_stability(windows, dispatch_seconds, window_seconds):
+    full = [w for w in windows if 0 <= w['start'] and w['end'] <= dispatch_seconds
+            and w['end'] - w['start'] >= window_seconds]
+    pass_rate = sum(w['slo_pass'] for w in full) / len(full) if full else None
+    first = [w for w in full if w['end'] <= 1800]
+    last = [w for w in full if w['start'] >= dispatch_seconds - 1800]
+
+    def average(group, key):
+        values = [w['metrics'][key] if key == 'output_tokens_per_second' else w['metrics'][key]['p95']
+                  for w in group]
+        if values and all(value is not None for value in values):
+            return sum(values) / len(values)
+        return None
+
+    drift = {}
+    for key in ('output_tokens_per_second', 'ttft', 'tpot'):
+        drift[key] = None
+        if dispatch_seconds >= 3600:
+            baseline = average(first, key)
+            tail = average(last, key)
+            if baseline is not None and baseline > 0 and tail is not None:
+                drift[key] = tail / baseline - 1
+    return dict(window_slo_pass_rate=pass_rate, drift_last_vs_first_30min=drift)
 
 
 def select(points, slo):
@@ -126,9 +140,7 @@ def overload_verdict(result):
     """External acceptance only; never claim to observe the internal queue."""
     m = result['metrics']
     rejected = sum(m['errors'].get(str(code), 0) for code in (429,503))
-    reasons = ['insufficient_load_duration' if reason=='insufficient_load' else reason
-               for reason in stage_verdict(result)['reasons']]
+    reasons = stage_verdict(result)['reasons']
     if rejected: reasons.append('requests_rejected')
-    if not result.get('recovered'): reasons.append('not_recovered')
     return dict(passed=not reasons, reasons=reasons,
                 rejection_observed=bool(rejected), internal_queue='unknown')

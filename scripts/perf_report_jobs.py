@@ -5,9 +5,11 @@ import json
 import os
 import re
 import shutil
+import sys
 from uuid import uuid4
 from pathlib import Path
 
+from perf_native_report import REPORT_CONTRACT_VERSION
 from run_journal import apply_access, atomic_json
 
 
@@ -32,16 +34,37 @@ def _read_json(path):
         raise ValueError(f'{path}: {exc}') from None
 
 
-def save_jobs(root, reports=(), discover=False, published_stages=()):
+def _completed_points(state):
+    for stage in ('scan', 'burst', 'overload'):
+        yield from state.get(stage, [])
+    if 'soak' in state:
+        yield state['soak']
+
+
+def _summary_points(summary):
+    points = {}
+    for profile, state in summary.get('profiles', {}).items():
+        for point in _completed_points(state):
+            log = point.get('requests_file')
+            if not isinstance(log, str) or not re.fullmatch(r'[A-Za-z0-9_-]+\.requests\.jsonl', log):
+                raise ValueError(f'Invalid completed stage request log for {profile}: {log!r}')
+            key = (profile, log.removesuffix('.requests.jsonl'))
+            if key in points:
+                raise ValueError(f'Duplicate completed stage: {profile}/{key[1]}')
+            points[key] = point
+    return points
+
+
+def save_jobs(root, reports=(), discover=False, required_stages=()):
     path = root/'report-jobs.json'
     manifest = _read_json(path) if path.exists() else dict(schema_version=1,jobs=[])
     known = {job['result_file'] for job in manifest['jobs']}
     candidates = [(name,label,folder/(label+'.json')) for name,label,folder,*_ in reports]
-    for entry in published_stages:
+    for entry in required_stages:
         profile,phase = entry['profile'],entry['phase']
         if not all(isinstance(part,str) and part and Path(part).name == part and part not in ('.','..')
                    for part in (profile,phase)):
-            raise ValueError('Invalid published stage identity')
+            raise ValueError('Invalid required stage identity')
         candidates.append((profile,phase,root/profile/(phase+'.json')))
     # Recover the small gap between atomic stage-result and queue writes; also
     # support runs made before report-jobs.json was introduced.
@@ -191,6 +214,51 @@ def check_report_destinations(root, profiles, config):
             raise ValueError(f'Report destination is a separate mount: {mount}')
 
 
+@contextmanager
+def _report_cleanup(path, interrupted, config):
+    try:
+        yield
+    except Exception as exc:
+        if not interrupted:
+            raise
+        print(f'Could not finalize {path}: {error_detail(exc, config)}', file=sys.stderr)
+
+
+def _check_stage_record(result, phase, summary, point):
+    log = phase + '.requests.jsonl'
+    if result.get('requests_file') != log:
+        raise ValueError(f"Expected {log}, stage specifies {result.get('requests_file')!r}")
+    contract = result.get('report_contract')
+    version = contract.get('version') if isinstance(contract, dict) else None
+    if 'report_contract_version' in summary:
+        required = summary['report_contract_version']
+        if type(required) is not int or required not in (1, REPORT_CONTRACT_VERSION):
+            raise ValueError(f'Unsupported run report_contract_version: {required!r}')
+        if version != required:
+            raise ValueError('Missing or conflicting stage report_contract for versioned run')
+    pulse = re.fullmatch(r'overload-c([0-9]+)-r([0-9]+)', phase)
+    if pulse:
+        concurrency = int(pulse[1])
+        if concurrency < 1 or pulse[2] not in ('1', '2', '3') or str(concurrency) != pulse[1]:
+            raise ValueError(f'Invalid overload pulse name: {phase}')
+        # write_report also verifies that the log contains metrics.requests rows.
+        for field, value in (('concurrency', result.get('concurrency')),
+                             ('request_limit', result.get('request_limit')),
+                             ('metrics.requests', result['metrics'].get('requests'))):
+            if type(value) is not int or value != concurrency:
+                raise ValueError(f'{phase} requires {field}={concurrency}, found {value!r}')
+    # A stage can commit just before the summary checkpoint. In that case its
+    # own identity and sealed log are still sufficient for offline recovery.
+    if point is None:
+        return
+    if version == REPORT_CONTRACT_VERSION or 'report_contract' in point:
+        if point.get('report_contract') != contract:
+            raise ValueError('Stage report contract conflicts with summary (identity or SHA-256)')
+        for field in ('duration', 'concurrency', 'request_limit'):
+            if point.get(field) != result.get(field):
+                raise ValueError(f'Stage {field} conflicts with summary')
+
+
 def generate_reports(root, config, summary, tokenizer, manifest):
     from perf_native_report import write_report
     root = Path(root).resolve()
@@ -215,8 +283,11 @@ def generate_reports(root, config, summary, tokenizer, manifest):
     public_files = {published,root/'vllm-report.txt'}
     summary['reporting_status'] = 'running'
     sanitize_errors(summary,config)
+    interrupted = False
     try:
         atomic_json(root/'summary.json',summary)
+        points = _summary_points(summary)
+        seen = set()
         for job in manifest['jobs']:
             job['status'] = 'pending'
             job.pop('error',None)
@@ -232,13 +303,12 @@ def generate_reports(root, config, summary, tokenizer, manifest):
                     path = _inside(root,expected)
                     relative = path.relative_to(root)
                     result = json.loads(path.read_text())
-                    if 'report_contract_version' in summary:
-                        version = summary['report_contract_version']
-                        if type(version) is not int or version != 1:
-                            raise ValueError(f'Unsupported run report_contract_version: {version!r}')
-                        if not isinstance(result.get('report_contract'),dict):
-                            raise ValueError('Missing stage report_contract for versioned run')
-                    requests = _inside(root,path.parent/result['requests_file'])
+                    key = (job['profile'], job['phase'])
+                    if key in seen:
+                        raise ValueError(f'Duplicate report job: {relative}')
+                    seen.add(key)
+                    _check_stage_record(result, job['phase'], summary, points.get(key))
+                    requests = _inside(root, path.with_suffix('.requests.jsonl'))
                     prefix = (generation/relative).with_suffix('')
                     prefix.parent.mkdir(parents=True,exist_ok=True)
                     names = write_report(requests,prefix,result['duration'],result['concurrency'],tokenizer,config,stage=result)
@@ -257,7 +327,7 @@ def generate_reports(root, config, summary, tokenizer, manifest):
                         **{k:str((prefix.parent/v).relative_to(root)) for k,v in names.items()}))
                     stages.append((job,path,result,names,requests))
                     label = job['phase']
-                    if (label.startswith(('scan-','overload-')) and 'recovery' not in label) or label=='soak':
+                    if (label.startswith(('scan-','burst-','overload-')) and 'recovery' not in label) or label=='soak':
                         text = (prefix.parent/names['text']).read_text()
                         heading = f"\n[{job['profile']}/{label}] vLLM v0.11.0 native metrics\n"
                         aggregate.write(heading+text)
@@ -268,6 +338,9 @@ def generate_reports(root, config, summary, tokenizer, manifest):
                     job.update(status='failed',error=detail)
                     raise RuntimeError(detail) from None
 
+        missing = points.keys() - seen
+        if missing:
+            raise ValueError('Missing report jobs: ' + ', '.join(f'{p}/{s}' for p, s in sorted(missing)))
         atomic_json(generation/published.name,index)
         # All stages passed integrity checks. Old indices address historical
         # files directly, so permission repairs also cover those paths.
@@ -299,27 +372,30 @@ def generate_reports(root, config, summary, tokenizer, manifest):
             if result.get('vllm_report') != names:
                 result['vllm_report'] = names
                 atomic_json(path,result)
-            state = summary.get('profiles',{}).get(job['profile'],{})
-            for point in state.get('scan',[])+state.get('overload',[])+[state.get('soak',{})]:
-                if point.get('requests_file') == result['requests_file']:
-                    point['vllm_report'] = names
+            point = points.get((job['profile'], job['phase']))
+            if point is not None:
+                point['vllm_report'] = names
             job['status'] = 'complete'
         summary['reporting_status'] = 'complete'
     except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
         summary['reporting_status'] = 'failed' if isinstance(exc,Exception) else 'pending'
         if isinstance(exc,Exception):
             summary.setdefault('errors',[]).append(dict(type=type(exc).__name__,phase='reporting',detail=error_detail(exc,config)))
         raise
     finally:
         # Inspect the actual pointer: interruption may follow rename immediately.
-        if not current.is_symlink() or current.readlink() != Path(generation.name):
-            shutil.rmtree(generation)
+        with _report_cleanup(generation, interrupted, config):
+            if not current.is_symlink() or current.readlink() != Path(generation.name):
+                shutil.rmtree(generation)
         for job in manifest['jobs']:
             if job['status'] == 'running':
                 job['status'] = 'pending'
-        atomic_json(root/'report-jobs.json',manifest)
-        summary['vllm_reports'] = json.loads(published.read_text()) if published.exists() else []
-        atomic_json(root/'summary.json',summary)
+        with _report_cleanup(root/'report-jobs.json', interrupted, config):
+            atomic_json(root/'report-jobs.json',manifest)
+        with _report_cleanup(root/'summary.json', interrupted, config):
+            summary['vllm_reports'] = json.loads(published.read_text()) if published.exists() else []
+            atomic_json(root/'summary.json',summary)
 
 
 @contextmanager
@@ -337,7 +413,15 @@ def output_lock(root):
 
 def rebuild_reports(root):
     root = Path(root).resolve(strict=True)
+    setup = root/'setup.json'
+    if setup.is_file() and _read_json(_inside(root, 'setup.json')).get('schema') in ('native_stages_v1', 'native_stages_v2', 'native_stages_v3', 'native_stages_v4'):
+        from perf_native_stages import publish_reports
+        with output_lock(root):
+            publish_reports(root)
+        return
     summary = _read_json(root/'summary.json')
+    if isinstance(summary, dict) and summary.get('mode') in ('native_stages', 'vllm_bench_serve'):
+        raise ValueError('Native reports are saved directly in each benchmark directory; see summary.json')
     if not isinstance(summary,dict) or not isinstance(summary.get('profiles'),dict) or not (root/'config.json').is_file():
         raise ValueError('Report rebuild requires an existing staged performance run')
     config = _read_json(root/'config.json')
@@ -392,19 +476,21 @@ def _rebuild_reports(root):
         required = list(summary.get('vllm_reports',[]))
         if published.exists():
             required.extend(_read_json(published))
-        manifest = save_jobs(root,discover=True,published_stages=required)
-        published_keys = {(entry['profile'],entry['phase']) for entry in required}
-        queued = {(job['profile'],job['phase']):job for job in manifest['jobs']}
-        for profile,phase in sorted(published_keys):
+        required.extend(dict(profile=p, phase=s) for p, s in _summary_points(summary))
+        manifest = save_jobs(root, discover=True, required_stages=required)
+        queued = {(job['profile'], job['phase']): job for job in manifest['jobs']}
+        missing = []
+        for profile, phase in sorted({(entry['profile'], entry['phase']) for entry in required}):
             relative = f'{profile}/{phase}.json'
-            job = queued.get((profile,phase))
+            job = queued.get((profile, phase))
             if job is None or job['result_file'] != relative:
-                raise ValueError(f'Published stage conflicts with report queue: {relative}')
-            if not _inside(root,relative).is_file():
-                detail = f'Missing completion record for published stage: {relative}'
-                job.update(status='failed',error=detail)
-                atomic_json(root/'report-jobs.json',manifest)
-                raise ValueError(detail)
+                raise ValueError(f'Required stage conflicts with report queue: {relative}')
+            if not _inside(root, relative).is_file():
+                job.update(status='failed', error=f'Missing completion record: {relative}')
+                missing.append(relative)
+        if missing:
+            atomic_json(root/'report-jobs.json', manifest)
+            raise ValueError('Missing completion records: ' + ', '.join(missing))
         if not manifest['jobs']:
             raise ValueError('No completed stages available for reporting')
         generate_reports(root,config,summary,_LegacyTokenizer(root,config),manifest)

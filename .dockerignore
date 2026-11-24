@@ -15,3 +15,8 @@
 !scripts/perf_vendor/LICENSE
 !scripts/perf_vendor/PROVENANCE.json
 !perf.native.example.json
+!docs/performance-testing.md
+!scripts/perf-then-eval
+!dataset-map.default.json
+!docs/examples/
+!docs/examples/vllm.full.conf

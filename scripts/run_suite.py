@@ -1,10 +1,12 @@
 #!/opt/venv/bin/python
 """Sequential remote-only evaluation suite with a JSON result and setup snapshot."""
+from eval_concurrency import write_records
 import argparse
 import ast
 import csv
 import json
 import os
+from uuid import UUID
 from pathlib import Path
 import re
 import subprocess
@@ -19,6 +21,7 @@ from importlib.metadata import version, PackageNotFoundError, distributions
 from urllib.parse import urlsplit
 from dataset_mapping import read_mapping, resolve
 from halluqa_eval import request
+from run_journal import atomic_json
 
 SCRIPTS = Path(__file__).resolve().parent
 ACTIVE_RUN = None
@@ -45,6 +48,10 @@ STAGE_ORDER = SUPPORTED
 
 
 def validate_config(config):
+    for key in ('concurrency', 'judge_concurrency'):
+        value = config.get(key, 1)
+        if type(value) is not int or value < 1:
+            raise ValueError(f'{key} must be a positive integer')
     for role in ('target', 'judge'):
         item = config[role]
         url = urlsplit(item['base_url'])
@@ -99,42 +106,64 @@ def generate(api, config, prompt):
 
 
 def generate_messages(api, config, messages):
+    return generate_choice(api, config, messages).message.content
+
+
+def generate_choice(api, config, messages):
     response = request(api, dict(model=config['model'], messages=messages,
                                 temperature=config.get('temperature', 0),
                                 max_tokens=config.get('max_tokens', 2048)))
-    if len(response.choices) != 1 or response.choices[0].finish_reason != 'stop':
+    if len(response.choices) != 1 or response.choices[0].finish_reason not in ('stop', 'length'):
         raise ValueError('Generation incomplete or rejected; inspect token limit/service')
     content = response.choices[0].message.content
     if not isinstance(content, str):
         raise ValueError('Missing generated text')
-    return content
+    return response.choices[0]
 
 
-def run(cmd, cwd, env=None):
+def stop_helper(process):
+    # Helpers own a process group; descendants can outlive its leader.
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def run(cmd, cwd, env=None, *, score_report=None):
     with (cwd / 'commands.log').open('a') as log:
         process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait()
-            if code:
-                raise subprocess.CalledProcessError(code, cmd)
-        except BaseException:
-            # Each helper owns a process group, including any descendants it starts.
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
-            finally:
+        except BaseException as exc:
+            stop_helper(process)
+            if score_report is not None and isinstance(exc, KeyboardInterrupt):
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                    if score_report.exists():
+                        report = json.loads(score_report.read_text())
+                        if report['status'] == 'running':
+                            report['status'] = 'interrupted'
+                            atomic_json(score_report, report)
+                except (OSError, ValueError, KeyError) as report_error:
+                    # Preserve the interruption so continue_on_error cannot start more work.
+                    detail = f'Could not finalize {score_report}: {report_error}'
+                    exc.add_note(detail)
+                    print(detail, file=sys.stderr)
             raise
+        if code == 1:
+            raise subprocess.CalledProcessError(code, cmd)
+        if code == os.EX_IOERR:
+            raise OSError(f'Scorer I/O failure; see {cwd / "commands.log"}')
+        if code:
+            raise OSError(f'Scorer exited with {code}; see {cwd / "commands.log"}')
 
 
 def votes(text, level):
@@ -173,24 +202,25 @@ def follow(config, folder, mappings, predictions):
                 out.flush()
     metadata, inputs, outputs = folder / 'judge_metadata', folder / 'judge_inputs', folder / 'judge_outputs'
     (outputs / 'target').mkdir(parents=True)
+    def judge_line(line):
+        item = json.loads(line)
+        for attempt in range(3):
+            text = generate(judge, {'max_tokens': 1024, **config['judge']}, item['prompt_new'])
+            try:
+                canonical = repr(votes(text, item['level']))
+                break
+            except (ValueError, SyntaxError):
+                if attempt == 2:
+                    raise
+        return {'prompt_new':item['prompt_new'],'choices':[{'message':{'content':canonical}}]}
+
     for category in categories[:-1]:
         acquire_discriminative_eval_input(str(data), str(responses), category, 'target', str(metadata), str(inputs))
-        with (outputs / relative_file(category)).open('w') as out:
-            for line in (metadata / relative_file(category)).read_text().splitlines():
-                item = json.loads(line)
-                for attempt in range(3):
-                    text = generate(judge, {'max_tokens': 1024, **config['judge']}, item['prompt_new'])
-                    try:
-                        canonical = repr(votes(text, item['level']))
-                        break
-                    except (ValueError, SyntaxError):
-                        if attempt == 2:
-                            raise
-                # Upstream parser receives only a validated literal list, never executable model text.
-                out.write(json.dumps({'prompt_new':item['prompt_new'],'choices':[{'message':{'content':canonical}}]})+'\n')
-                out.flush()
+        lines = (metadata / relative_file(category)).read_text().splitlines()
+        write_records(outputs / relative_file(category), judge_line, lines,
+                      config.get('judge_concurrency', 1), len(lines))
     results = folder / 'evaluation_result'
-    run([sys.executable,str(code/'eval.py'),'--model_paths','target','--data_path',str(data),
+    run([sys.executable,str(SCRIPTS/'followbench_score.py'),str(code/'eval.py'),'--model_paths','target','--data_path',str(data),
          '--api_output_path',str(responses),'--data_gpt4_discriminative_eval_input_path',str(metadata),
          '--gpt4_discriminative_eval_output_path',str(outputs),'--evaluation_result_path',str(results)], folder)
     expected = {'example_rule_based.csv','example_csl.csv'} | {f'{category}_{metric}.csv' for category in categories[:-1] for metric in ('hsr','ssr','csl')}
@@ -230,7 +260,9 @@ def hallu(config, folder, mappings, predictions):
     env = dict(os.environ, DATASET_MAP=str(folder/'score-dataset-map.json'), OPENAI_API_KEY=os.environ[config['judge']['api_key_env']],
                OPENAI_BASE_URL=config['judge']['base_url'], JUDGE_MODEL=config['judge']['model'])
     run([sys.executable,str(SCRIPTS/'halluqa_eval.py'),'--responses',str(folder/'responses.json'),
-         '--output-dir',str(folder/'score'),'--timeout',str(config['judge'].get('timeout',60))], folder, env)
+         '--concurrency',str(config.get('judge_concurrency', 1)),
+         '--output-dir',str(folder/'score'),'--timeout',str(config['judge'].get('timeout',60))], folder, env,
+        score_report=folder/'score/run.json')
     result = json.loads((folder/'score/run.json').read_text())
     if result['status'] != 'complete':
         raise ValueError('HalluQA incomplete')
@@ -263,7 +295,9 @@ def setup_snapshot(config, pinned):
         'created_at': datetime.now(timezone.utc).isoformat(),
         'stages': selected_stages(config),
         **roles,
-        'opencompass': {'revision': __import__('compass_runner').REVISION, 'options': config.get('options', {}), 'transport': 'strict OpenAI chat completions; no truncation'},
+        'concurrency': config.get('concurrency', 1),
+        'judge_concurrency': config.get('judge_concurrency', 1),
+        'opencompass': {'revision': __import__('compass_runner').REVISION, 'options': config.get('options', {}), 'transport': 'OpenAI chat completions; full input; stop and length accepted'},
         'followbench': {'language': config.get('followbench', {}).get('language', 'en'),
                         'judge_invalid_attempts': 3} if 'followbench' in selected_stages(config) else None,
         'halluqa': {'votes': 5, 'temperature': 0, 'top_p': 0.5, 'max_tokens': 10,
@@ -290,6 +324,7 @@ def _main():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--validate-only', action='store_true', help='Load data and prepare prompts without API calls')
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--group-id', type=UUID, help=argparse.SUPPRESS)
     opts = parser.parse_args()
     config = json.loads(opts.config.read_text())
     ACTIVE_CONFIG = config
@@ -310,7 +345,8 @@ def _main():
     mappings = read_mapping(mapping_file)
     selected_keys = [('followbench_'+config.get('followbench',{}).get('language','en')
                       if name == 'followbench' else name) for name in stages]
-    root = create_run(root, [opts.config,mapping_file,*(mappings.get(key) for key in selected_keys)])
+    root = create_run(root, [opts.config,mapping_file,*(mappings.get(key) for key in selected_keys)],
+                      group_id=opts.group_id, phase='accuracy')
     from run_journal import RunJournal
     ACTIVE_RUN = journal = RunJournal(root, stages, STAGE_ORDER)
     validate_config(config)
@@ -357,18 +393,15 @@ def _main():
         journal.start(name)
         try:
             result = execute(name,prepared[name],config,folder,pinned)
-        except BaseException as exc:
+        except OSError:
+            # Artifact integrity is unknown. Never advance to the next dataset.
+            raise
+        except Exception as exc:
             partial = folder/'metrics.partial.json'
             result = json.loads(partial.read_text()) if partial.exists() else []
             detail = failure_details(exc, config)
             (folder/'error.txt').write_text(detail)
             journal.error(exc, detail)
-            if isinstance(exc, KeyboardInterrupt):
-                journal.record(name, result, error=exc)
-                journal.data['status'][name] = 'interrupted'
-                raise
-            if not isinstance(exc, Exception):
-                raise
             journal.record(name, result, error=exc)
             print(f'{name} failed: {type(exc).__name__}; see stage artifacts',file=sys.stderr)
             if not config.get('continue_on_error',True):
@@ -379,25 +412,59 @@ def _main():
     return int(journal.data['overall_status'] != 'complete')
 
 
+def finalize_failure(exc, interrupted):
+    journal = ACTIVE_RUN
+    detail = failure_details(exc, ACTIVE_CONFIG) if journal is not None else str(exc)
+    if isinstance(exc, OSError):
+        print(detail, file=sys.stderr, flush=True)
+    if journal is None:
+        return
+    name = journal.data['active_dataset']
+    if name and journal.data['status'][name] == 'running':
+        partial = journal.root/name/'metrics.partial.json'
+        try:
+            journal.merge_metrics(name, json.loads(partial.read_text()))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as err:
+            print(f'Could not restore {partial}: {err}', file=sys.stderr, flush=True)
+    try:
+        journal.error(exc, detail, flush=False)
+        journal.terminate(interrupted=interrupted)
+    except OSError as err:
+        print(f'Could not finalize {journal.root / "summary.json"}: {err}', file=sys.stderr, flush=True)
+
+
 def main():
     global ACTIVE_RUN
     ACTIVE_RUN = None
     previous = signal.signal(signal.SIGTERM, terminate_handler)
     try:
         return _main()
-    except (SuiteInterrupted, KeyboardInterrupt) as exc:
-        if ACTIVE_RUN is not None:
-            ACTIVE_RUN.error(exc, failure_details(exc, ACTIVE_CONFIG))
-            ACTIVE_RUN.terminate(interrupted=True)
+    except KeyboardInterrupt as exc:
+        finalize_failure(exc, interrupted=True)
         return 143 if isinstance(exc, SuiteInterrupted) else 130
     except Exception as exc:
-        if ACTIVE_RUN is not None:
-            ACTIVE_RUN.error(exc, failure_details(exc, ACTIVE_CONFIG))
-            ACTIVE_RUN.terminate()
+        finalize_failure(exc, interrupted=False)
         raise
     finally:
         signal.signal(signal.SIGTERM, previous)
 
 
+def cli():
+    try:
+        code = main()
+    except OSError:
+        # main already reported the error to stderr.
+        return 1
+    if code in (130, 143):
+        # The journal and partial files are closed. Interpreter shutdown would
+        # otherwise join request threads that may still be blocked in socket I/O.
+        os._exit(code)
+    return code
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    # Scorers import run_suite during execution and share this run's journal.
+    sys.modules['run_suite'] = sys.modules[__name__]
+    sys.exit(cli())

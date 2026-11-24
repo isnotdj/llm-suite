@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0,str(Path(__file__).parents[1]/'scripts'))
 from perf_engine import FailureGuard
-from perf_metrics import metrics, stage_verdict, recovery_passes, select, overload_verdict
+from perf_metrics import metrics, stage_verdict, select, overload_verdict
 
 
 def point():
@@ -17,40 +17,53 @@ def point():
 
 
 class HealthPolicy(unittest.TestCase):
+    def test_soak_stability_uses_complete_dispatch_windows(self):
+        from perf_metrics import soak_stability
+        def window(start, end, rate, passed=True):
+            return dict(start=start, end=end, slo_pass=passed,
+                        metrics=dict(output_tokens_per_second=rate, ttft={'p95': .1}, tpot={'p95': .01}))
+        active = [window(t, t+60, 100) for t in range(0, 3600, 60)]
+        drain = [window(t, t+60, 0, False) for t in range(3600, 4200, 60)]
+        result = soak_stability(active + drain, 3600, 60)
+        self.assertEqual(result['drift_last_vs_first_30min'], dict(output_tokens_per_second=0, ttft=0, tpot=0))
+        self.assertEqual(result['window_slo_pass_rate'], 1)
+        active[0] = window(0, 60, 0, False)
+        active[0]['metrics']['ttft']['p95'] = None
+        result = soak_stability(active + [window(3590, 3650, 0, False)], 3600, 60)
+        self.assertAlmostEqual(result['window_slo_pass_rate'], 59/60)
+        self.assertIsNone(result['drift_last_vs_first_30min']['ttft'])
+        short = soak_stability([window(0, 58, 100)], 58, 60)
+        self.assertIsNone(short['window_slo_pass_rate'])
+        self.assertTrue(all(v is None for v in short['drift_last_vs_first_30min'].values()))
+        zero = soak_stability([window(0, 60, 0), window(3540, 3600, 100)], 3600, 60)
+        self.assertIsNone(zero['drift_last_vs_first_30min']['output_tokens_per_second'])
+
     def test_bad_points_excluded_consistently(self):
-        for failure in ('sufficient','aborted','client','success','truncated','mismatch','empty'):
+        for failure in ('sufficient','aborted','client','success','mismatch','empty'):
             p=point()
             if failure=='sufficient': p['sufficient']=False
             if failure=='aborted': p['aborted']='no_success'
             if failure=='client': p['client_bottleneck_suspected']=True
             if failure=='success': p['metrics']['success_rate']=.998
-            if failure=='truncated': p['metrics']['truncated']=1
             if failure=='mismatch': p['metrics']['input_token_mismatches']=1
             if failure=='empty': p['metrics']['requests']=0
             with self.subTest(failure=failure):
                 self.assertFalse(stage_verdict(p)['passed'])
                 self.assertTrue(stage_verdict(p)['reasons'])
                 self.assertIsNone(select([p],dict(ttft_ms=2000,tpot_ms=50))['sweet_concurrency'])
-                self.assertFalse(recovery_passes(p,point()))
                 self.assertFalse(overload_verdict(dict(p,recovered=True))['passed'])
+
+    def test_length_termination_is_healthy(self):
+        p = point()
+        p['metrics']['truncated'] = 1
+        self.assertTrue(stage_verdict(p)['passed'])
+        self.assertTrue(overload_verdict(dict(p, recovered=True))['passed'])
 
     def test_health_and_latency_are_independent(self):
         p=point();p['metrics']['ttft']['p95']=3
         self.assertTrue(stage_verdict(p)['passed'])
         self.assertEqual(stage_verdict(p,dict(ttft_ms=2000,tpot_ms=50))['reasons'],['ttft_slo'])
         self.assertTrue(overload_verdict(dict(p,recovered=True))['passed'])
-
-    def test_success_and_recovery_thresholds(self):
-        p=point();p['metrics']['success_rate']=.999
-        self.assertTrue(stage_verdict(p)['passed'])
-        self.assertFalse(stage_verdict(p,perfect=True)['passed'])
-        p=point();base=point()
-        p['metrics']['ttft']['p95']=base['metrics']['ttft']['p95']*1.2
-        self.assertTrue(recovery_passes(p,base))
-        p['metrics']['ttft']['p95']+=1e-6
-        self.assertFalse(recovery_passes(p,base))
-        p=point();base['metrics']['tpot']['p95']=None
-        self.assertFalse(recovery_passes(p,base))
 
     def test_tail_must_be_adjacent_and_healthy(self):
         points=[point() for _ in range(3)]

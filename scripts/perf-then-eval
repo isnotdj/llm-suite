@@ -1,0 +1,46 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo 'Usage: perf-then-eval [--output DIR] [PERF_CONFIG ACCURACY_CONFIG]'
+    echo 'Default output: /tmp/vllm-suite'
+    echo 'Default configs: /config/perf.json /config/suite.local.json'
+}
+
+output=/tmp/vllm-suite
+perf_config=/config/perf.json
+accuracy_config=/config/suite.local.json
+configs=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --output)
+            if [ -z "${2:-}" ]; then usage >&2; exit 2; fi
+            output=$2
+            shift 2
+            ;;
+        -*) usage >&2; exit 2 ;;
+        *)
+            case $configs in
+                0) perf_config=$1 ;;
+                1) accuracy_config=$1 ;;
+                *) usage >&2; exit 2 ;;
+            esac
+            configs=$((configs + 1))
+            shift
+            ;;
+    esac
+done
+if [ "$configs" -eq 1 ]; then usage >&2; exit 2; fi
+
+for config in "$perf_config" "$accuracy_config"; do
+    if [ ! -f "$config" ] || [ ! -r "$config" ]; then
+        echo "Cannot read configuration: $config" >&2
+        exit 1
+    fi
+done
+
+run_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+perf-suite --config "$perf_config" --output "$output" --group-id "$run_id" --stage all
+exec eval-suite --config "$accuracy_config" --output "$output" --group-id "$run_id"

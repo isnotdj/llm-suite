@@ -1,8 +1,10 @@
 # 全量精度评测操作指南
 
+容器内可用统一入口 `vllm-suite` 读取当前目录的 `.vllm.conf`，同一次执行共用一个 UUID 结果目录。[运行示例](../README.md#在已启动的容器内运行) · [全参数配置](examples/vllm.full.conf)
+
 本文覆盖项目支持的九项精度评测：准备数据、挂载 NAS、配置远程模型、校验和运行。数据下载需联网；正式评测无需下载依赖，但容器必须能访问目标模型和裁判模型的 OpenAI 兼容 API。
 
-镜像内的 CPU 版 PyTorch 是精度评测框架 OpenCompass 的依赖，镜像不包含 vLLM 推理引擎或模型权重。`eval-suite` 通过远程 API 评测，`perf-suite` 内置 vLLM benchmark 请求实现；完整的原生 vLLM benchmark 使用 Dockerfile 中单独的 `native-bench` 构建阶段。精度评测不需要挂载 tokenizer。
+镜像内置 OpenCompass 和官方 vLLM 远程压测客户端。在容器内执行 `eval-suite` 可以单独评测精度，执行 `perf-then-eval` 会先压测再评测精度。单独评测精度只需挂载科目数据，压测还需本地 tokenizer。
 
 ## 1. 准备 NAS 数据
 
@@ -102,6 +104,13 @@ export RUN_ROOT=/var/tmp/vllm-suite
 mkdir -p "$RUN_ROOT/config" "$RUN_ROOT/outputs" "$RUN_ROOT/cache"
 ```
 
+在包含本指南和并发实现的项目根目录构建本地镜像，并用同一标签验收。
+
+```bash
+docker build --platform linux/amd64 -t vllm-suite .
+docker run --rm --network none vllm-suite python /opt/evaluation/scripts/integration_check.py
+```
+
 确认宿主机已挂载 NAS，再启动容器。将 `/mnt/nas/vllm-suite/datasets` 改成实际路径；宿主机 NAS 数据必须对容器运行用户可读。
 
 ```bash
@@ -111,7 +120,7 @@ docker run -dit \
   -v "$RUN_ROOT/config":/config:ro \
   -v "$RUN_ROOT/outputs":/outputs \
   -v "$RUN_ROOT/cache":/cache \
-  aegondj/vllm-suite:main-be4adc0 \
+  vllm-suite \
   bash
 ```
 
@@ -185,7 +194,11 @@ JSON
 
 不设置 `limit` 和 `subsets` 即选择所列评测的全部样本和子集。FinSafetyBench 使用中英文直接提问基线；FollowBench 一次只能选 `zh` 或 `en`。若两种语言都要测，可先按上述配置运行，再复制一份配置，将 `datasets` 设为 `["followbench"]`、`followbench.language` 改为 `en`，单独运行第二次。
 
-LongBench 会发送长上下文，目标模型必须支持对应上下文长度；程序不会自动截断。全量评测可能耗时较长并产生大量目标和裁判请求，请提前确认服务容量和配额。
+LongBench 会发送长上下文，目标模型必须支持对应上下文长度；程序不会自动截断。服务因达到生成长度上限返回 `length` 时，精度测试使用已生成文本正常评分，裁判回复仍须满足题目的评分格式。全量评测可能耗时较长并产生大量目标和裁判请求，请提前确认服务容量和配额。
+
+精度配置顶层可设置 `"concurrency": 8` 和 `"judge_concurrency": 4`，分别限制单次运行中目标模型和裁判同时进行的请求数。两个值必须是正整数，默认均为 1。任意请求完成即可补位。运行中的 `*.partial.jsonl` 按完成顺序保存序号和回答，子集完整后才按输入顺序发布正式 JSONL。读取输入或请求失败时，旁边的 `*.failure.json` 记录失败阶段（input/request）、从零开始的序号和错误类型；已派发的请求可继续结束，缺题子集不计分。结果写入失败会终止整次运行；即使启用 `continue_on_error`，也只在当前请求全部收尾且结果可记录后继续。
+
+查看本次运行的退出码和本地运行目录中的 `summary.json`。成功退出码为 0，数据集失败或结果写入失败为 1，Ctrl-C 为 130，SIGTERM 为 143。中断时保留已经写入 `metrics.partial.json` 的子集成绩，尚未开始的数据集标记为 `not_run`。如果磁盘已满导致最终汇总无法更新，以退出码和标准错误为准，磁盘上的汇总可能仍显示运行中。
 
 ## 5. 校验并运行
 
@@ -213,6 +226,8 @@ eval-suite --config /config/suite.local.json \
 ```
 
 数据集串行执行；`continue_on_error: true` 时某项失败仍会继续执行后续项，最终返回非零退出码。校验通过仅说明本地准备成功，正式运行还需要 API 连通并正常返回。
+
+HalluQA 裁判运行中收到 Ctrl-C 或 SIGTERM 时，父进程先停止并回收裁判进程组，再将仍处于 `running` 的 `halluqa/score/run.json` 标为 `interrupted`，并更新总报告。若输出盘写入失败，进程仍会被回收，终端会显示写入错误。
 
 ## 6. 查看结果
 

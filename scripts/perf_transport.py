@@ -162,7 +162,7 @@ class Transport:
             count = 0  # failed request, excluded from throughput/latency statistics
         elif estimated:
             count = len(self.tokenizer.encode(observation['text'],add_special_tokens=False))
-        success = bool(native.success and not invalid and observation.get('done') and finish == 'stop' and first is not None)
+        success = bool(native.success and not invalid and observation.get('done') and finish in ('stop', 'length') and first is not None)
         ttft = first-started if first is not None else None
         latency = ended-started
         error = protocol_error or native.error
@@ -189,7 +189,7 @@ class Transport:
             token_source='invalid' if invalid else 'estimated' if estimated else 'usage', http_status=observation.get('http_status'),
             timeout_phase=observation.get('timeout_phase'),
             error_kind=observation.get('error_kind') or (None if success else ('transport' if observation.get('http_status') is None else 'response')),
-            error=error or (None if success else 'Incomplete or non-natural completion'),
+            error=error or (None if success else 'Incomplete or rejected completion'),
             native_ttft=native.ttft, native_latency=native.latency,
             native_output=native_output, native_output_origin=native_origin,
             native_input_tokens=sample['input_tokens'],native_report_tokens=native_count,
